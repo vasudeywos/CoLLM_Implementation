@@ -9,11 +9,17 @@ def collm_loss(c_v, c_w, c, z, logit_scale):
     # Clamp temperature to avoid numerical instability
     temperature = torch.clamp(torch.exp(logit_scale), max=100.0).to(c_v.dtype) ##Change
     
+    #Changed: float
     def contrastive_loss(query, target):
-        logits = (query @ target.T) * temperature
+        query = query.float()
+        target = target.float()
+
+        logits = (query @ target.T) * temperature.float()
+
         labels = torch.arange(len(query), device=query.device)
         loss_q2t = F.cross_entropy(logits, labels)
         loss_t2q = F.cross_entropy(logits.T, labels)
+
         return (loss_q2t + loss_t2q) / 2.0
 
     loss_v = contrastive_loss(c_v, z)

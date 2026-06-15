@@ -1,8 +1,9 @@
 import os
 import argparse
-from pathlib import Path
+import json
 import torch
 from transformers import AutoTokenizer
+from torch.utils.tensorboard import SummaryWriter
 
 from dataset import get_cc3m_dataloader
 from model import CoLLMStage1
@@ -18,21 +19,30 @@ def get_nearest_neighbors(h_prime_detached):
 
 def main():
     parser = argparse.ArgumentParser()
-    # Note: Use shell expansion syntax for WebDataset
-    parser.add_argument("--data_pattern", type=str, required=True, 
-                        help="e.g. /home/rahul/shyam/aditya/training/cc3m_downloaded_80k_224/{00000..00011}.tar")
+    # 1. Path directly matched to your directory structure
+    parser.add_argument("--data_pattern", type=str, 
+                        default="/home/rahul/shyam/aditya/training/cc3m_downloaded_80k_224/{00000..00011}.tar")
     parser.add_argument("--llm_model", type=str, default="Qwen/Qwen3-Embedding-0.6B")
-    parser.add_argument("--llm_dim", type=int, default=1024) # Change to 4096 if switching to SFR
+    parser.add_argument("--llm_dim", type=int, default=1024)
     parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--log_dir", type=str, default="./logs")
+    parser.add_argument("--output_dir", type=str, default="./checkpoints")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # 1. Dataset
+    # 2. Setup Directories and TensorBoard
+    os.makedirs(args.log_dir, exist_ok=True)
+    os.makedirs(args.output_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=args.log_dir)
+    step_logs = []
+
+    # 3. Dataset
     dataloader = get_cc3m_dataloader(args.data_pattern, batch_size=args.batch_size)
 
-    # 2. Tokenizer & Model
+    # 4. Tokenizer & Model
     tokenizer = AutoTokenizer.from_pretrained(args.llm_model, padding_side="left")
     
     model = CoLLMStage1(
@@ -42,20 +52,21 @@ def main():
     ).to(device)
     model.train()
 
-    # 3. Optimizer
+    # 5. Optimizer
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_params, lr=1e-4, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=0.01)
 
     print("Starting training...")
-    # Since WebDataset streams, we just loop over it
+    
+    # 6. Training Loop (WebDataset loops until tar files are exhausted)
     for step, batch in enumerate(dataloader):
         aug_images = batch["aug_images"].to(device)
         target_images = batch["target_images"].to(device)
         captions = batch["captions"]
         
         # 1. Target Branch (DETACHED)
-        with torch.no_grad():
-            z = model.encode_image_features(target_images)
+        # with torch.no_grad():
+        z = model.encode_image_features(target_images)
 
         # 2. Augmented Branch (WITH GRADIENTS for CLIP)
         h_prime = model.encode_image_features(aug_images)
@@ -80,8 +91,44 @@ def main():
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
+        # 7. Logging to TensorBoard and JSON
+        temperature_val = torch.exp(model.logit_scale).item()
+
+        writer.add_scalar("Loss/Total", loss_dict["loss"], step)
+        writer.add_scalar("Loss/Image_Only_cv", loss_dict["img_only"], step)
+        writer.add_scalar("Loss/Text_Only_cw", loss_dict["txt_only"], step)
+        writer.add_scalar("Loss/Composed_c", loss_dict["comp"], step)
+        writer.add_scalar("Metrics/Temperature", temperature_val, step)
+        
+        step_logs.append({
+            "step": step,
+            "loss": loss_dict["loss"],
+            "loss_cv": loss_dict["img_only"],
+            "loss_cw": loss_dict["txt_only"],
+            "loss_c": loss_dict["comp"],
+            "temperature": temperature_val
+        })
+
         if step % 10 == 0:
-            print(f"Step {step} | Loss {loss.item():.4f} | Temperature {torch.exp(model.logit_scale).item():.2f} | L_v {loss_dict['loss_image_only']:.4f}")
+            print(f"Step {step:4d} | Total Loss {loss.item():.4f} | Temp {temperature_val:.2f} | Image-Only L_v {loss_dict['img_only']:.4f}")
+
+        # Save checkpoint periodically (every 500 steps ~ 32,000 images)
+        if step > 0 and step % 500 == 0:
+            ckpt_path = os.path.join(args.output_dir, f"checkpoint_step_{step}.pt")
+            torch.save(model.state_dict(), ckpt_path)
+            print(f"Saved Checkpoint -> {ckpt_path}")
+
+    # 8. End of Training Cleanup
+    final_ckpt = os.path.join(args.output_dir, "checkpoint_final.pt")
+    torch.save(model.state_dict(), final_ckpt)
+    print(f"\nFinal Checkpoint Saved -> {final_ckpt}")
+
+    with open(os.path.join(args.log_dir, "training_logs.json"), "w") as f:
+        json.dump(step_logs, f, indent=4)
+    print(f"Logs saved -> {args.log_dir}/training_logs.json")
+
+    writer.close()
+    print("Training complete!")
 
 if __name__ == "__main__":
     main()

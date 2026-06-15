@@ -7,7 +7,7 @@ def collm_loss(c_v, c_w, c, z, logit_scale):
     Uses a learnable temperature (logit_scale) instead of fixed 0.07.
     """
     # Clamp temperature to avoid numerical instability
-    temperature = torch.clamp(torch.exp(logit_scale), max=100.0)
+    temperature = torch.clamp(torch.exp(logit_scale), max=100.0).to(c_v.dtype) ##Change
     
     def contrastive_loss(query, target):
         logits = (query @ target.T) * temperature

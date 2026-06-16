@@ -81,10 +81,10 @@ def main():
         
         # 1. Target Branch (DETACHED)
         # with torch.no_grad():
-        z = model.encode_image_features(target_images)
+        #Changed as new encodings
+        z = model.encode_target(target_images)
 
-        # 2. Augmented Branch (WITH GRADIENTS for CLIP)
-        h_prime = model.encode_image_features(aug_images)
+        h_prime = model.encode_reference(aug_images)
 
         # 3. Nearest Neighbor (DETACHED)
         with torch.no_grad():
@@ -138,10 +138,23 @@ def main():
         # Save checkpoint periodically (every 500 steps ~ 32,000 images)
         if step > 0 and step % 500 == 0:
             ckpt_path = os.path.join(args.output_dir, f"checkpoint_step_{step}.pt")
+            # torch.save(
+            #     {
+            #         "step": step,
+            #         "model_state_dict": model.state_dict(),
+            #         "optimizer_state_dict": optimizer.state_dict(),
+            #     },
+            #     ckpt_path,
+            # )
+            #Change:
             torch.save(
                 {
                     "step": step,
-                    "model_state_dict": model.state_dict(),
+                    "clip_lora": model.clip.state_dict(),        # only LoRA layers inside
+                    "llm_lora": model.llm.state_dict(),          # only LoRA layers inside
+                    "image_adapter": model.image_adapter.state_dict(),
+                    "projection_head": model.projection_head.state_dict(),
+                    "logit_scale": model.logit_scale.item(),
                     "optimizer_state_dict": optimizer.state_dict(),
                 },
                 ckpt_path,
@@ -150,7 +163,18 @@ def main():
 
     # 8. End of Training Cleanup
     final_ckpt = os.path.join(args.output_dir, "checkpoint_final.pt")
-    torch.save(model.state_dict(), final_ckpt)
+    # torch.save(model.state_dict(), final_ckpt)
+    #Change:
+    torch.save(
+        {
+            "clip_lora": model.clip.state_dict(),
+            "llm_lora": model.llm.state_dict(),
+            "image_adapter": model.image_adapter.state_dict(),
+            "projection_head": model.projection_head.state_dict(),
+            "logit_scale": model.logit_scale.item(),
+        },
+        final_ckpt,
+    )
     print(f"\nFinal Checkpoint Saved -> {final_ckpt}")
 
     with open(os.path.join(args.log_dir, "training_logs.json"), "w") as f:

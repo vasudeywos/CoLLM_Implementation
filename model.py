@@ -66,7 +66,6 @@ class CoLLMStage1(nn.Module):
 
         #Added:
         self.llm.gradient_checkpointing_enable()
-        self.clip.vision_model.gradient_checkpointing_enable()
         
         # Inject <image> token safely
         self.image_token = "<image>"

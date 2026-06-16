@@ -43,7 +43,11 @@ class CoLLMStage1(nn.Module):
         
         # 1. Vision Encoder
         self.clip = CLIPModel.from_pretrained(clip_model_name)
-        clip_lora = LoraConfig(r=lora_rank, lora_alpha=lora_rank, target_modules=["q_proj", "k_proj", "v_proj", "out_proj"], bias="none")
+        clip_lora = LoraConfig(r=lora_rank, 
+                               lora_alpha=lora_rank, 
+                               target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
+                               lora_dropout=0.1,#Added 
+                               bias="none")
         self.clip.vision_model = get_peft_model(self.clip.vision_model, clip_lora)
         for p in self.clip.text_model.parameters(): p.requires_grad = False
         for p in self.clip.text_projection.parameters(): p.requires_grad = False
@@ -59,7 +63,12 @@ class CoLLMStage1(nn.Module):
             self.llm.resize_token_embeddings(len(self.tokenizer))
         self.image_token_id = self.tokenizer.convert_tokens_to_ids(self.image_token)
 
-        llm_lora = LoraConfig(r=lora_rank, lora_alpha=lora_rank, target_modules=["q_proj", "k_proj", "v_proj", "o_proj"], bias="none", task_type=TaskType.FEATURE_EXTRACTION)
+        llm_lora = LoraConfig(r=lora_rank, 
+                              lora_alpha=lora_rank, 
+                              target_modules=["q_proj", "k_proj", "v_proj", "o_proj"], 
+                              lora_dropout=0.1,#Added
+                              bias="none", 
+                              task_type=TaskType.FEATURE_EXTRACTION)
         self.llm = get_peft_model(self.llm, llm_lora)
 
         # 3. Adapters & Learnable Temperature

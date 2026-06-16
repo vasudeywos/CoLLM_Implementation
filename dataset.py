@@ -42,7 +42,9 @@ def get_cc3m_dataloader(tar_path_pattern, batch_size=64, num_workers=4):
     tar_path_pattern should be e.g., "/path/to/cc3m_downloaded_80k_224/{00000..00011}.tar"
     """
     dataset = (
-        wds.WebDataset(tar_path_pattern, resampled=True)
+        wds.WebDataset(tar_path_pattern,
+                        resampled=True,
+                        shardshuffle=100)
         .shuffle(1000)
         .decode("pil")
         .to_tuple("jpg", "txt")

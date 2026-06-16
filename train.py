@@ -52,6 +52,20 @@ def main():
     ).to(device)
     model.train()
 
+    trainable_params = sum(
+        p.numel()
+        for p in model.parameters()
+        if p.requires_grad
+    )
+
+    total_params = sum(
+        p.numel()
+        for p in model.parameters()
+    )
+
+    print(f"Trainable params: {trainable_params:,}")
+    print(f"Total params:     {total_params:,}")
+
     # 5. Optimizer
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=0.01)
@@ -110,12 +124,27 @@ def main():
         })
 
         if step % 10 == 0:
-            print(f"Step {step:4d} | Total Loss {loss.item():.4f} | Temp {temperature_val:.2f} | Image-Only L_v {loss_dict['img_only']:.4f}")
+            print(
+                f"Step {step:4d} | "
+                f"Loss {loss_dict['loss']:.4f} | "
+                f"L_v {loss_dict['img_only']:.4f} | "
+                f"L_w {loss_dict['txt_only']:.4f} | "
+                f"L_c {loss_dict['comp']:.4f} | "
+                f"Temp {temperature_val:.2f}",
+                flush=True
+            )
 
         # Save checkpoint periodically (every 500 steps ~ 32,000 images)
         if step > 0 and step % 500 == 0:
             ckpt_path = os.path.join(args.output_dir, f"checkpoint_step_{step}.pt")
-            torch.save(model.state_dict(), ckpt_path)
+            torch.save(
+                {
+                    "step": step,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                },
+                ckpt_path,
+            )
             print(f"Saved Checkpoint -> {ckpt_path}")
 
     # 8. End of Training Cleanup

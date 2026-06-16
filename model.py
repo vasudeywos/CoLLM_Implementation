@@ -121,6 +121,8 @@ class CoLLMStage1(nn.Module):
         if visual_token is not None:
             mask = (encoded["input_ids"] == self.image_token_id)
             vt = visual_token.squeeze(1).to(inputs_embeds.dtype)
+            #Changed:
+            inputs_embeds = inputs_embeds.clone()
             inputs_embeds[mask] = vt
 
         outputs = self.llm(inputs_embeds=inputs_embeds, attention_mask=encoded["attention_mask"])

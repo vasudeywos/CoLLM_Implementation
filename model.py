@@ -63,6 +63,10 @@ class CoLLMStage1(nn.Module):
         # 2. LLM
         # Use bfloat16 to save memory and match Qwen/SFR natives
         self.llm = AutoModel.from_pretrained(llm_model_name, torch_dtype=torch.bfloat16)
+
+        #Added:
+        self.llm.gradient_checkpointing_enable()
+        self.clip.vision_model.gradient_checkpointing_enable()
         
         # Inject <image> token safely
         self.image_token = "<image>"

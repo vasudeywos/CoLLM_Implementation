@@ -136,46 +136,81 @@ def main():
             )
 
         # Save checkpoint periodically (every 500 steps ~ 32,000 images)
-        if step > 0 and step % 500 == 0:
-            ckpt_path = os.path.join(args.output_dir, f"checkpoint_step_{step}.pt")
-            # torch.save(
-            #     {
-            #         "step": step,
-            #         "model_state_dict": model.state_dict(),
-            #         "optimizer_state_dict": optimizer.state_dict(),
-            #     },
-            #     ckpt_path,
-            # )
-            #Change:
+        # if step > 0 and step % 500 == 0:
+        #     ckpt_path = os.path.join(args.output_dir, f"checkpoint_step_{step}.pt")
+        #     torch.save(
+        #         {
+        #             "step": step,
+        #             "model_state_dict": model.state_dict(),
+        #             "optimizer_state_dict": optimizer.state_dict(),
+        #         },
+        #         ckpt_path,
+        #     )
+        #     print(f"Saved Checkpoint -> {ckpt_path}")
+
+        #Changed for LoRA only svaing:
+
+        if step > 0 and step % 1000 == 0:
+
+            ckpt_dir = os.path.join(
+                args.output_dir,
+                f"checkpoint_step_{step}"
+            )
+
+            os.makedirs(ckpt_dir, exist_ok=True)
+
+            model.clip.vision_model.save_pretrained(
+                os.path.join(ckpt_dir, "clip_lora")
+            )
+
+            model.llm.save_pretrained(
+                os.path.join(ckpt_dir, "llm_lora")
+            )
+
             torch.save(
                 {
                     "step": step,
-                    "clip_lora": model.clip.state_dict(),        # only LoRA layers inside
-                    "llm_lora": model.llm.state_dict(),          # only LoRA layers inside
                     "image_adapter": model.image_adapter.state_dict(),
-                    "projection_head": model.projection_head.state_dict(),
-                    "logit_scale": model.logit_scale.item(),
+                    "projection": model.projection.state_dict(),
+                    "logit_scale": model.logit_scale.detach().cpu(),
                     "optimizer_state_dict": optimizer.state_dict(),
                 },
-                ckpt_path,
+                os.path.join(ckpt_dir, "extra_modules.pt"),
             )
-            print(f"Saved Checkpoint -> {ckpt_path}")
+
+            print(f"Saved Checkpoint -> {ckpt_dir}")
 
     # 8. End of Training Cleanup
-    final_ckpt = os.path.join(args.output_dir, "checkpoint_final.pt")
+    # final_ckpt = os.path.join(args.output_dir, "checkpoint_final.pt")
     # torch.save(model.state_dict(), final_ckpt)
-    #Change:
+    # print(f"\nFinal Checkpoint Saved -> {final_ckpt}")
+
+    #Changed for LoRA only saving:
+    final_dir = os.path.join(
+        args.output_dir,
+        "checkpoint_final"
+    )
+
+    os.makedirs(final_dir, exist_ok=True)
+
+    model.clip.vision_model.save_pretrained(
+        os.path.join(final_dir, "clip_lora")
+    )
+
+    model.llm.save_pretrained(
+        os.path.join(final_dir, "llm_lora")
+    )
+
     torch.save(
         {
-            "clip_lora": model.clip.state_dict(),
-            "llm_lora": model.llm.state_dict(),
             "image_adapter": model.image_adapter.state_dict(),
-            "projection_head": model.projection_head.state_dict(),
-            "logit_scale": model.logit_scale.item(),
+            "projection": model.projection.state_dict(),
+            "logit_scale": model.logit_scale.detach().cpu(),
         },
-        final_ckpt,
+        os.path.join(final_dir, "extra_modules.pt"),
     )
-    print(f"\nFinal Checkpoint Saved -> {final_ckpt}")
+
+    print(f"\nFinal Checkpoint Saved -> {final_dir}")
 
     with open(os.path.join(args.log_dir, "training_logs.json"), "w") as f:
         json.dump(step_logs, f, indent=4)

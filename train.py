@@ -22,8 +22,9 @@ def main():
     # 1. Path directly matched to your directory structure
     parser.add_argument("--data_pattern", type=str, 
                         default="/home/rahul/shyam/aditya/training/cc3m_downloaded_80k_224/{00000..00011}.tar")
-    parser.add_argument("--llm_model", type=str, default="Qwen/Qwen3-Embedding-0.6B")
-    parser.add_argument("--llm_dim", type=int, default=1024)
+    #Changed for SFR-Embedding-2R
+    parser.add_argument("--llm_model", type=str, default="Salesforce/SFR-Embedding-2_R")
+    parser.add_argument("--llm_dim", type=int, default=4096)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--log_dir", type=str, default="./logs")

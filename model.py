@@ -5,8 +5,9 @@ import numpy as np
 from transformers import CLIPModel, AutoModel
 from peft import LoraConfig, get_peft_model, TaskType
 
+#Changed for SFR-Embedding-2R
 class ImageAdapter(nn.Module):
-    def __init__(self, clip_dim: int = 768, llm_dim: int = 1024):
+    def __init__(self, clip_dim: int = 1024, llm_dim: int = 4096):
         super().__init__()
         self.proj = nn.Sequential(
             nn.Linear(clip_dim, llm_dim),
@@ -16,8 +17,9 @@ class ImageAdapter(nn.Module):
     def forward(self, x):
         return self.proj(x).unsqueeze(1)  # [B, 1, 1024]
 
+#Changed for SFR-Embedding-2R
 class ProjectionHead(nn.Module):
-    def __init__(self, llm_dim: int = 1024, embed_dim: int = 768):
+    def __init__(self, llm_dim: int = 4096, embed_dim: int = 768):
         super().__init__()
         self.proj = nn.Linear(llm_dim, embed_dim)
     def forward(self, x):
@@ -32,11 +34,17 @@ def last_token_pool(last_hidden_states, attention_mask):
         batch_size = last_hidden_states.shape[0]
         return last_hidden_states[torch.arange(batch_size, device=last_hidden_states.device), sequence_lengths]
 
+#Changed for SFR-Embedding-2R
 class CoLLMStage1(nn.Module):
     def __init__(
-        self, tokenizer, clip_model_name="openai/clip-vit-large-patch14",
-        llm_model_name="Qwen/Qwen3-Embedding-0.6B", lora_rank=64,
-        clip_dim=768, llm_dim=1024, embed_dim=768
+        self,
+        tokenizer,
+        clip_model_name="openai/clip-vit-large-patch14",
+        llm_model_name="Salesforce/SFR-Embedding-2_R",
+        lora_rank=64,
+        clip_dim=1024,
+        llm_dim=4096,
+        embed_dim=768
     ):
         super().__init__()
         self.tokenizer = tokenizer
@@ -76,10 +84,17 @@ class CoLLMStage1(nn.Module):
         self.projection = ProjectionHead(llm_dim, embed_dim).to(torch.bfloat16)
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
-    def encode_image_features(self, pixel_values):
+    #Adapter for Ref
+    def encode_target(self, pixel_values):
+        """z_i: 768-dim retrieval space, used as contrastive target (no grad needed)"""
         outputs = self.clip.vision_model(pixel_values=pixel_values)
         image_embeds = self.clip.visual_projection(outputs.pooler_output)
-        return F.normalize(image_embeds, dim=-1)
+        return F.normalize(image_embeds, dim=-1)   # [B, 768]
+
+    def encode_reference(self, pixel_values):
+        """h'_i: 1024-dim pooler output, feeds into ImageAdapter → LLM (needs grad)"""
+        outputs = self.clip.vision_model(pixel_values=pixel_values)
+        return F.normalize(outputs.pooler_output, dim=-1)   # [B, 1024]
 
     def encode_query(self, visual_token=None, texts=None, device=None):
         B = visual_token.shape[0] if visual_token is not None else len(texts)

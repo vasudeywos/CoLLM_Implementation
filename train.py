@@ -122,7 +122,9 @@ def main():
 
         with torch.no_grad():
             nn_embeds, nn_indices = get_nearest_neighbors(h_prime.detach())
-        captions_j = [captions[i] for i in nn_indices]
+            
+        # Changed
+        captions_j = [captions[i.item()] for i in nn_indices]
 
         h_star = slerp(h_prime, nn_embeds, t=0.5)           # [B, 1024]
         mod_texts = get_modification_texts(captions, captions_j, synthesis_ratio=0.75)

@@ -193,7 +193,7 @@ class CoLLMStage1(nn.Module):
             instructions,
             padding=True,
             truncation=True,
-            max_length=256,
+            max_length=128,
             return_tensors="pt",
         ).to(device)
 
@@ -255,7 +255,7 @@ class CoLLMStage1(nn.Module):
             c_w_parts.append(self.encode_query(visual_token=None, texts=caps, device=device))
             c_parts.append(self.encode_query(visual_token=vt, texts=mods, device=device))
 
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
+            # if device.type == "cuda":
+            #     torch.cuda.empty_cache()
 
         return torch.cat(c_v_parts, dim=0), torch.cat(c_w_parts, dim=0), torch.cat(c_parts, dim=0)

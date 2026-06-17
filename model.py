@@ -32,6 +32,16 @@ def resolve_llm_quantization(requested: str = "auto") -> bool:
         return False
 
 
+def resolve_compute_dtype(device=None):
+    if device is not None and device.type == "cuda":
+        major, _ = torch.cuda.get_device_capability(device)
+        return torch.bfloat16 if major >= 8 else torch.float16
+    if torch.cuda.is_available():
+        major, _ = torch.cuda.get_device_capability()
+        return torch.bfloat16 if major >= 8 else torch.float16
+    return torch.float32
+
+
 class ImageAdapter(nn.Module):
     def __init__(self, clip_dim: int = 1024, llm_dim: int = 4096):
         super().__init__()
@@ -51,6 +61,7 @@ class ProjectionHead(nn.Module):
         self.proj = nn.Linear(llm_dim, embed_dim)
 
     def forward(self, x):
+        x = x.to(self.proj.weight.dtype)
         return F.normalize(self.proj(x), dim=-1)
 
 
@@ -84,6 +95,7 @@ class CoLLMStage1(nn.Module):
         self.tokenizer = tokenizer
         self.use_4bit = resolve_llm_quantization(llm_precision)
         self.llm_dim = llm_dim
+        self.compute_dtype = resolve_compute_dtype(device)
 
         self.clip = CLIPModel.from_pretrained(clip_model_name)
         clip_lora = LoraConfig(
@@ -102,14 +114,14 @@ class CoLLMStage1(nn.Module):
         attn_impl = resolve_attn_implementation(attn_implementation)
         llm_kwargs = {
             "attn_implementation": attn_impl,
-            "torch_dtype": torch.bfloat16,
+            "torch_dtype": self.compute_dtype,
         }
 
         if self.use_4bit:
             bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_compute_dtype=self.compute_dtype,
                 bnb_4bit_use_double_quant=True,
             )
             llm_kwargs["quantization_config"] = bnb_config
@@ -137,8 +149,8 @@ class CoLLMStage1(nn.Module):
         )
         self.llm = get_peft_model(self.llm, llm_lora)
 
-        self.image_adapter = ImageAdapter(clip_dim, llm_dim).to(torch.bfloat16)
-        self.projection = ProjectionHead(llm_dim, embed_dim).to(torch.bfloat16)
+        self.image_adapter = ImageAdapter(clip_dim, llm_dim).to(self.compute_dtype)
+        self.projection = ProjectionHead(llm_dim, embed_dim).to(self.compute_dtype)
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
         if device is not None:
@@ -216,7 +228,7 @@ class CoLLMStage1(nn.Module):
         if device is None:
             device = self.llm_device
 
-        visual_token = self.image_adapter(h_star.to(torch.bfloat16))
+        visual_token = self.image_adapter(h_star.to(self.compute_dtype))
 
         c_v = self.encode_query(visual_token=visual_token, texts=None, device=device)
         c_w = self.encode_query(visual_token=None, texts=captions, device=device)
@@ -241,7 +253,7 @@ class CoLLMStage1(nn.Module):
         if device is None:
             device = self.llm_device
 
-        visual_token = self.image_adapter(h_star.to(torch.bfloat16))
+        visual_token = self.image_adapter(h_star.to(self.compute_dtype))
         n = h_star.shape[0]
         c_v_parts, c_w_parts, c_parts = [], [], []
 

@@ -7,14 +7,11 @@ from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_tr
 
 
 def resolve_attn_implementation(requested: str = "auto") -> str:
-    if requested in ("flash_attention_2", "sdpa", "eager"):
-        return requested
-    try:
-        import flash_attn  # noqa: F401
-        return "flash_attention_2"
-    except ImportError:
-        print("flash-attn not installed; falling back to sdpa")
+    if requested == "auto":
         return "sdpa"
+    if requested in ("sdpa", "eager"):
+        return requested
+    raise ValueError(f"Unsupported attention implementation: {requested}")
 
 
 def resolve_llm_quantization(requested: str = "auto") -> bool:

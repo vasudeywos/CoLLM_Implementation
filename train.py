@@ -54,8 +54,9 @@ def main():
     parser.add_argument(
         "--attn_implementation",
         type=str,
-        default="auto",
-        choices=["auto", "flash_attention_2", "sdpa", "eager"],
+        default="sdpa",
+        choices=["auto", "sdpa", "eager"],
+        help="Attention backend for the LLM. auto resolves to sdpa.",
     )
     args = parser.parse_args()
 

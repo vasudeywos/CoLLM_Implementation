@@ -6,10 +6,11 @@ from transformers import AutoTokenizer
 from torch.utils.tensorboard import SummaryWriter
 
 from dataset import get_cc3m_dataloader
-from model import CoLLMStage1
+from model import CoLLMStage1, resolve_attn_implementation, resolve_llm_quantization
 from loss import collm_loss
 from slerp import slerp
 from text_synthesis import get_modification_texts
+
 
 def get_nearest_neighbors(h_prime_detached):
     sim_matrix = h_prime_detached @ h_prime_detached.T
@@ -17,96 +18,130 @@ def get_nearest_neighbors(h_prime_detached):
     nn_indices = sim_matrix.argmax(dim=1)
     return h_prime_detached[nn_indices], nn_indices
 
+
 def main():
     parser = argparse.ArgumentParser()
-    # 1. Path directly matched to your directory structure
-    parser.add_argument("--data_pattern", type=str, 
-                        default="/home/rahul/shyam/aditya/training/cc3m_downloaded_80k_224/{00000..00011}.tar")
-    #Changed for SFR-Embedding-2R
+    parser.add_argument(
+        "--data_pattern",
+        type=str,
+        default="/home/rahul/shyam/aditya/training/cc3m_downloaded_80k_224/{00000..00011}.tar",
+    )
     parser.add_argument("--llm_model", type=str, default="Salesforce/SFR-Embedding-2_R")
     parser.add_argument("--llm_dim", type=int, default=4096)
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=32,
+        help="Contrastive batch size (logits are [B x B]). NN/Slerp also use this full batch.",
+    )
+    parser.add_argument(
+        "--llm_micro_batch",
+        type=int,
+        default=8,
+        help="Micro-batch for the 3 LLM query forwards; keeps peak VRAM low while B=32 for loss.",
+    )
+    parser.add_argument("--lora_rank", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--log_dir", type=str, default="./logs")
     parser.add_argument("--output_dir", type=str, default="./checkpoints")
+    parser.add_argument(
+        "--llm_precision",
+        type=str,
+        default="auto",
+        choices=["auto", "4bit", "bf16"],
+        help="auto: 4-bit QLoRA when bitsandbytes is installed, else bf16.",
+    )
+    parser.add_argument(
+        "--attn_implementation",
+        type=str,
+        default="auto",
+        choices=["auto", "flash_attention_2", "sdpa", "eager"],
+    )
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    if args.batch_size % args.llm_micro_batch != 0:
+        raise ValueError(
+            f"batch_size ({args.batch_size}) must be divisible by "
+            f"llm_micro_batch ({args.llm_micro_batch})"
+        )
 
-    # 2. Setup Directories and TensorBoard
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    attn_impl = resolve_attn_implementation(args.attn_implementation)
+    use_4bit = resolve_llm_quantization(args.llm_precision)
+    print(f"Using device: {device}")
+    print(f"Contrastive batch size: {args.batch_size}")
+    print(f"LLM micro-batch size:   {args.llm_micro_batch}")
+    print(f"LLM precision:          {'4-bit QLoRA' if use_4bit else 'bf16 (full weights)'}")
+    print(f"Attention backend:      {attn_impl}")
+
     os.makedirs(args.log_dir, exist_ok=True)
     os.makedirs(args.output_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=args.log_dir)
     step_logs = []
 
-    # 3. Dataset
     dataloader = get_cc3m_dataloader(args.data_pattern, batch_size=args.batch_size)
 
-    # 4. Tokenizer & Model
     tokenizer = AutoTokenizer.from_pretrained(args.llm_model, padding_side="left")
-    
+
     model = CoLLMStage1(
-        tokenizer=tokenizer, 
-        llm_model_name=args.llm_model, 
-        llm_dim=args.llm_dim
-    ).to(device)
+        tokenizer=tokenizer,
+        llm_model_name=args.llm_model,
+        llm_dim=args.llm_dim,
+        lora_rank=args.lora_rank,
+        llm_precision=args.llm_precision,
+        attn_implementation=args.attn_implementation,
+        device=device,
+    )
     model.train()
 
-    trainable_params = sum(
-        p.numel()
-        for p in model.parameters()
-        if p.requires_grad
-    )
-
-    total_params = sum(
-        p.numel()
-        for p in model.parameters()
-    )
-
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
     print(f"Trainable params: {trainable_params:,}")
     print(f"Total params:     {total_params:,}")
 
-    # 5. Optimizer
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=args.lr,
+        weight_decay=0.01,
+    )
+    optimizer.zero_grad()
 
     print("Starting training...")
-    
-    # 6. Training Loop (WebDataset loops until tar files are exhausted)
+
     for step, batch in enumerate(dataloader):
-        aug_images = batch["aug_images"].to(device)
-        target_images = batch["target_images"].to(device)
+        aug_images = batch["aug_images"].to(device, non_blocking=True)
+        target_images = batch["target_images"].to(device, non_blocking=True)
         captions = batch["captions"]
-        
-        # 1. Target Branch (DETACHED)
-        # with torch.no_grad():
-        #Changed as new encodings
-        z = model.encode_target(target_images)
 
-        h_prime = model.encode_reference(aug_images)
+        # --- Full-batch CLIP path (never micro-batched) ---
+        with torch.no_grad():
+            z = model.encode_target(target_images)          # [B, 768]
 
-        # 3. Nearest Neighbor (DETACHED)
+        h_prime = model.encode_reference(aug_images)        # [B, 1024]
+
         with torch.no_grad():
             nn_embeds, nn_indices = get_nearest_neighbors(h_prime.detach())
         captions_j = [captions[i] for i in nn_indices]
 
-        # 4. Slerp & Synthesis
-        h_star = slerp(h_prime, nn_embeds, t=0.5)
+        h_star = slerp(h_prime, nn_embeds, t=0.5)           # [B, 1024]
         mod_texts = get_modification_texts(captions, captions_j, synthesis_ratio=0.75)
 
-        # 5. Get Queries
-        c_v, c_w, c = model.forward_queries(h_star, captions, mod_texts, device)
+        # --- LLM-only micro-batching; concat back to [B, D] for [B x B] loss ---
+        c_v, c_w, c = model.forward_llm_queries_microbatched(
+            h_star,
+            captions,
+            mod_texts,
+            micro_batch=args.llm_micro_batch,
+            device=model.llm_device,
+        )
 
-        # 6. Loss & Backprop
+        # Single [B x B] contrastive loss — equivalent to one forward at batch_size=B.
         loss, loss_dict = collm_loss(c_v, c_w, c, z, model.logit_scale)
-
-        optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
 
-        # 7. Logging to TensorBoard and JSON
         temperature_val = torch.exp(model.logit_scale).item()
 
         writer.add_scalar("Loss/Total", loss_dict["loss"], step)
@@ -114,14 +149,14 @@ def main():
         writer.add_scalar("Loss/Text_Only_cw", loss_dict["txt_only"], step)
         writer.add_scalar("Loss/Composed_c", loss_dict["comp"], step)
         writer.add_scalar("Metrics/Temperature", temperature_val, step)
-        
+
         step_logs.append({
             "step": step,
             "loss": loss_dict["loss"],
             "loss_cv": loss_dict["img_only"],
             "loss_cw": loss_dict["txt_only"],
             "loss_c": loss_dict["comp"],
-            "temperature": temperature_val
+            "temperature": temperature_val,
         })
 
         if step % 10 == 0:
@@ -132,41 +167,15 @@ def main():
                 f"L_w {loss_dict['txt_only']:.4f} | "
                 f"L_c {loss_dict['comp']:.4f} | "
                 f"Temp {temperature_val:.2f}",
-                flush=True
+                flush=True,
             )
-
-        # Save checkpoint periodically (every 500 steps ~ 32,000 images)
-        # if step > 0 and step % 500 == 0:
-        #     ckpt_path = os.path.join(args.output_dir, f"checkpoint_step_{step}.pt")
-        #     torch.save(
-        #         {
-        #             "step": step,
-        #             "model_state_dict": model.state_dict(),
-        #             "optimizer_state_dict": optimizer.state_dict(),
-        #         },
-        #         ckpt_path,
-        #     )
-        #     print(f"Saved Checkpoint -> {ckpt_path}")
-
-        #Changed for LoRA only svaing:
 
         if step > 0 and step % 1000 == 0:
-
-            ckpt_dir = os.path.join(
-                args.output_dir,
-                f"checkpoint_step_{step}"
-            )
-
+            ckpt_dir = os.path.join(args.output_dir, f"checkpoint_step_{step}")
             os.makedirs(ckpt_dir, exist_ok=True)
 
-            model.clip.vision_model.save_pretrained(
-                os.path.join(ckpt_dir, "clip_lora")
-            )
-
-            model.llm.save_pretrained(
-                os.path.join(ckpt_dir, "llm_lora")
-            )
-
+            model.clip.vision_model.save_pretrained(os.path.join(ckpt_dir, "clip_lora"))
+            model.llm.save_pretrained(os.path.join(ckpt_dir, "llm_lora"))
             torch.save(
                 {
                     "step": step,
@@ -177,30 +186,13 @@ def main():
                 },
                 os.path.join(ckpt_dir, "extra_modules.pt"),
             )
-
             print(f"Saved Checkpoint -> {ckpt_dir}")
 
-    # 8. End of Training Cleanup
-    # final_ckpt = os.path.join(args.output_dir, "checkpoint_final.pt")
-    # torch.save(model.state_dict(), final_ckpt)
-    # print(f"\nFinal Checkpoint Saved -> {final_ckpt}")
-
-    #Changed for LoRA only saving:
-    final_dir = os.path.join(
-        args.output_dir,
-        "checkpoint_final"
-    )
-
+    final_dir = os.path.join(args.output_dir, "checkpoint_final")
     os.makedirs(final_dir, exist_ok=True)
 
-    model.clip.vision_model.save_pretrained(
-        os.path.join(final_dir, "clip_lora")
-    )
-
-    model.llm.save_pretrained(
-        os.path.join(final_dir, "llm_lora")
-    )
-
+    model.clip.vision_model.save_pretrained(os.path.join(final_dir, "clip_lora"))
+    model.llm.save_pretrained(os.path.join(final_dir, "llm_lora"))
     torch.save(
         {
             "image_adapter": model.image_adapter.state_dict(),
@@ -218,6 +210,7 @@ def main():
 
     writer.close()
     print("Training complete!")
+
 
 if __name__ == "__main__":
     main()

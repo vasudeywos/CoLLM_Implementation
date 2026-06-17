@@ -1,8 +1,10 @@
 import torch
 import torch.nn.functional as F
+import math
 
 def collm_loss(c_v, c_w, c, z, logit_scale):
-    temperature = torch.clamp(torch.exp(logit_scale), max=100.0)
+    safe_logit_scale = torch.clamp(logit_scale.float(), min=0.0, max=math.log(100.0))
+    temperature = torch.exp(safe_logit_scale)
 
     def contrastive_loss(query, target):
         query = query.float()

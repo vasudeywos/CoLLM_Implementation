@@ -1,6 +1,7 @@
 import os
 import argparse
 import json
+import math
 import torch
 from transformers import AutoTokenizer
 from torch.utils.tensorboard import SummaryWriter
@@ -41,7 +42,10 @@ def main():
         help="Micro-batch for the 3 LLM query forwards; keeps peak VRAM low while B=32 for loss.",
     )
     parser.add_argument("--lora_rank", type=int, default=64)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--logit_scale_lr", type=float, default=1e-5)
+    parser.add_argument("--warmup_ratio", type=float, default=0.05)
+    parser.add_argument("--max_steps", type=int, default=10000)
     parser.add_argument("--log_dir", type=str, default="./logs")
     parser.add_argument("--output_dir", type=str, default="./checkpoints")
     parser.add_argument(
@@ -74,6 +78,10 @@ def main():
     print(f"LLM micro-batch size:   {args.llm_micro_batch}")
     print(f"LLM precision:          {'4-bit QLoRA' if use_4bit else 'bf16 (full weights)'}")
     print(f"Attention backend:      {attn_impl}")
+    print(f"Learning rate:          {args.lr}")
+    print(f"Logit scale LR:         {args.logit_scale_lr}")
+    print(f"Max steps:              {args.max_steps}")
+    print(f"Warmup ratio:           {args.warmup_ratio}")
 
     os.makedirs(args.log_dir, exist_ok=True)
     os.makedirs(args.output_dir, exist_ok=True)
@@ -100,13 +108,30 @@ def main():
     print(f"Trainable params: {trainable_params:,}")
     print(f"Total params:     {total_params:,}")
 
+    logit_scale_params = [model.logit_scale]
+    logit_scale_param_ids = {id(p) for p in logit_scale_params}
+    main_params = [
+        p
+        for p in model.parameters()
+        if p.requires_grad and id(p) not in logit_scale_param_ids
+    ]
     optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=args.lr,
-        weight_decay=0.01,
+        [
+            {"params": main_params, "lr": args.lr, "weight_decay": 0.01},
+            {"params": logit_scale_params, "lr": args.logit_scale_lr, "weight_decay": 0.0},
+        ]
     )
+    warmup_steps = max(1, int(args.max_steps * args.warmup_ratio))
+
+    def lr_lambda(current_step):
+        if current_step < warmup_steps:
+            return float(current_step + 1) / float(warmup_steps)
+        return 1.0
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
     optimizer.zero_grad()
 
+    print(f"Warmup steps:           {warmup_steps}")
     print("Starting training...")
 
     for step, batch in enumerate(dataloader):
@@ -122,8 +147,7 @@ def main():
 
         with torch.no_grad():
             nn_embeds, nn_indices = get_nearest_neighbors(h_prime.detach())
-            
-        # Changed
+
         captions_j = [captions[i.item()] for i in nn_indices]
 
         h_star = slerp(h_prime, nn_embeds, t=0.5)           # [B, 1024]
@@ -140,18 +164,27 @@ def main():
 
         # Single [B x B] contrastive loss — equivalent to one forward at batch_size=B.
         loss, loss_dict = collm_loss(c_v, c_w, c, z, model.logit_scale)
+        if not torch.isfinite(loss):
+            print(f"Skipping step {step}: non-finite loss {loss.item()}", flush=True)
+            optimizer.zero_grad(set_to_none=True)
+            continue
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        scheduler.step()
+        with torch.no_grad():
+            model.logit_scale.clamp_(min=0.0, max=math.log(100.0))
         optimizer.zero_grad(set_to_none=True)
 
-        temperature_val = torch.exp(model.logit_scale).item()
+        temperature_val = torch.exp(model.logit_scale.float()).item()
 
         writer.add_scalar("Loss/Total", loss_dict["loss"], step)
         writer.add_scalar("Loss/Image_Only_cv", loss_dict["img_only"], step)
         writer.add_scalar("Loss/Text_Only_cw", loss_dict["txt_only"], step)
         writer.add_scalar("Loss/Composed_c", loss_dict["comp"], step)
         writer.add_scalar("Metrics/Temperature", temperature_val, step)
+        writer.add_scalar("LR/Main", scheduler.get_last_lr()[0], step)
+        writer.add_scalar("LR/Logit_Scale", scheduler.get_last_lr()[1], step)
 
         step_logs.append({
             "step": step,
@@ -190,6 +223,10 @@ def main():
                 os.path.join(ckpt_dir, "extra_modules.pt"),
             )
             print(f"Saved Checkpoint -> {ckpt_dir}")
+
+        if step + 1 >= args.max_steps:
+            print(f"Reached max_steps={args.max_steps}")
+            break
 
     final_dir = os.path.join(args.output_dir, "checkpoint_final")
     os.makedirs(final_dir, exist_ok=True)

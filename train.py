@@ -58,9 +58,14 @@ def main():
     parser.add_argument(
         "--attn_implementation",
         type=str,
-        default="sdpa",
+        default="eager",
         choices=["auto", "sdpa", "eager"],
-        help="Attention backend for the LLM. auto resolves to sdpa.",
+        help="Attention backend for the LLM. eager is most stable on Turing GPUs.",
+    )
+    parser.add_argument(
+        "--gradient_checkpointing",
+        action="store_true",
+        help="Enable LLM gradient checkpointing (saves VRAM, less stable with 4-bit).",
     )
     args = parser.parse_args()
 
@@ -77,7 +82,10 @@ def main():
     print(f"Contrastive batch size: {args.batch_size}")
     print(f"LLM micro-batch size:   {args.llm_micro_batch}")
     print(f"LLM precision:          {'4-bit QLoRA' if use_4bit else 'bf16 (full weights)'}")
+    if use_4bit:
+        print(f"BNB compute dtype:      bfloat16")
     print(f"Attention backend:      {attn_impl}")
+    print(f"Gradient checkpointing: {args.gradient_checkpointing}")
     print(f"Learning rate:          {args.lr}")
     print(f"Logit scale LR:         {args.logit_scale_lr}")
     print(f"Max steps:              {args.max_steps}")
@@ -99,6 +107,7 @@ def main():
         lora_rank=args.lora_rank,
         llm_precision=args.llm_precision,
         attn_implementation=args.attn_implementation,
+        gradient_checkpointing=args.gradient_checkpointing,
         device=device,
     )
     model.train()
@@ -107,6 +116,9 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Trainable params: {trainable_params:,}")
     print(f"Total params:     {total_params:,}")
+    print(f"LLM compute dtype:       {model.compute_dtype}")
+    print(f"Image adapter dtype:     {next(model.image_adapter.parameters()).dtype}")
+    print(f"Projection dtype:        {next(model.projection.parameters()).dtype}")
 
     logit_scale_params = [model.logit_scale]
     logit_scale_param_ids = {id(p) for p in logit_scale_params}
@@ -119,7 +131,8 @@ def main():
         [
             {"params": main_params, "lr": args.lr, "weight_decay": 0.01},
             {"params": logit_scale_params, "lr": args.logit_scale_lr, "weight_decay": 0.0},
-        ]
+        ],
+        eps=1e-6,
     )
     warmup_steps = max(1, int(args.max_steps * args.warmup_ratio))
 
@@ -169,7 +182,15 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             continue
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            max_norm=1.0,
+            error_if_nonfinite=False,
+        )
+        if not torch.isfinite(grad_norm):
+            print(f"Skipping step {step}: non-finite grad norm {grad_norm.item()}", flush=True)
+            optimizer.zero_grad(set_to_none=True)
+            continue
         optimizer.step()
         scheduler.step()
         with torch.no_grad():

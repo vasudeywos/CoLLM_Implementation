@@ -42,6 +42,11 @@ def resolve_compute_dtype(device=None):
     return torch.float32
 
 
+def resolve_bnb_compute_dtype() -> torch.dtype:
+    """4-bit QLoRA matmuls always use bf16 for numerical stability (incl. Turing GPUs)."""
+    return torch.bfloat16
+
+
 class ImageAdapter(nn.Module):
     def __init__(self, clip_dim: int = 1024, llm_dim: int = 4096):
         super().__init__()
@@ -89,13 +94,18 @@ class CoLLMStage1(nn.Module):
         embed_dim=768,
         llm_precision="auto",
         attn_implementation="auto",
+        gradient_checkpointing=False,
         device=None,
     ):
         super().__init__()
         self.tokenizer = tokenizer
         self.use_4bit = resolve_llm_quantization(llm_precision)
         self.llm_dim = llm_dim
-        self.compute_dtype = resolve_compute_dtype(device)
+        self.bnb_compute_dtype = resolve_bnb_compute_dtype() if self.use_4bit else None
+        self.compute_dtype = (
+            self.bnb_compute_dtype if self.use_4bit else resolve_compute_dtype(device)
+        )
+        self.gradient_checkpointing = gradient_checkpointing
 
         self.clip = CLIPModel.from_pretrained(clip_model_name)
         clip_lora = LoraConfig(
@@ -121,7 +131,7 @@ class CoLLMStage1(nn.Module):
             bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=self.compute_dtype,
+                bnb_4bit_compute_dtype=self.bnb_compute_dtype,
                 bnb_4bit_use_double_quant=True,
             )
             llm_kwargs["quantization_config"] = bnb_config
@@ -131,7 +141,8 @@ class CoLLMStage1(nn.Module):
         self.llm = AutoModel.from_pretrained(llm_model_name, **llm_kwargs)
         if self.use_4bit:
             self.llm = prepare_model_for_kbit_training(self.llm)
-        self.llm.gradient_checkpointing_enable()
+        if self.gradient_checkpointing:
+            self.llm.gradient_checkpointing_enable()
 
         self.image_token = "<image>"
         if self.image_token not in self.tokenizer.get_vocab():
@@ -149,8 +160,8 @@ class CoLLMStage1(nn.Module):
         )
         self.llm = get_peft_model(self.llm, llm_lora)
 
-        self.image_adapter = ImageAdapter(clip_dim, llm_dim).to(self.compute_dtype)
-        self.projection = ProjectionHead(llm_dim, embed_dim).to(self.compute_dtype)
+        self.image_adapter = ImageAdapter(clip_dim, llm_dim).to(torch.float32)
+        self.projection = ProjectionHead(llm_dim, embed_dim).to(torch.float32)
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
         if device is not None:
@@ -228,7 +239,8 @@ class CoLLMStage1(nn.Module):
         if device is None:
             device = self.llm_device
 
-        visual_token = self.image_adapter(h_star.to(self.compute_dtype))
+        adapter_dtype = next(self.image_adapter.parameters()).dtype
+        visual_token = self.image_adapter(h_star.to(adapter_dtype))
 
         c_v = self.encode_query(visual_token=visual_token, texts=None, device=device)
         c_w = self.encode_query(visual_token=None, texts=captions, device=device)
@@ -253,7 +265,8 @@ class CoLLMStage1(nn.Module):
         if device is None:
             device = self.llm_device
 
-        visual_token = self.image_adapter(h_star.to(self.compute_dtype))
+        adapter_dtype = next(self.image_adapter.parameters()).dtype
+        visual_token = self.image_adapter(h_star.to(adapter_dtype))
         n = h_star.shape[0]
         c_v_parts, c_w_parts, c_parts = [], [], []
 

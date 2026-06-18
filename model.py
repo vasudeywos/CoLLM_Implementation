@@ -88,7 +88,7 @@ class CoLLMStage1(nn.Module):
         tokenizer,
         clip_model_name="openai/clip-vit-large-patch14",
         llm_model_name="Salesforce/SFR-Embedding-2_R",
-        lora_rank=32,
+        lora_rank=64,
         clip_dim=1024,
         llm_dim=4096,
         embed_dim=768,

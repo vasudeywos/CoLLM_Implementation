@@ -2,6 +2,7 @@ import os
 import argparse
 import json
 import math
+import time
 import torch
 from transformers import AutoTokenizer
 from torch.utils.tensorboard import SummaryWriter
@@ -148,6 +149,10 @@ def main():
     print("Starting training...")
 
     for step, batch in enumerate(dataloader):
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        step_start = time.perf_counter()
+
         aug_images = batch["aug_images"].to(device, non_blocking=True)
         target_images = batch["target_images"].to(device, non_blocking=True)
         captions = batch["captions"]
@@ -198,6 +203,9 @@ def main():
         optimizer.zero_grad(set_to_none=True)
 
         temperature_val = torch.exp(model.logit_scale.float()).item()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        step_time = time.perf_counter() - step_start
 
         writer.add_scalar("Loss/Total", loss_dict["loss"], step)
         writer.add_scalar("Loss/Image_Only_cv", loss_dict["img_only"], step)
@@ -206,6 +214,7 @@ def main():
         writer.add_scalar("Metrics/Temperature", temperature_val, step)
         writer.add_scalar("LR/Main", scheduler.get_last_lr()[0], step)
         writer.add_scalar("LR/Logit_Scale", scheduler.get_last_lr()[1], step)
+        writer.add_scalar("Timing/Step_Seconds", step_time, step)
 
         step_logs.append({
             "step": step,
@@ -214,6 +223,7 @@ def main():
             "loss_cw": loss_dict["txt_only"],
             "loss_c": loss_dict["comp"],
             "temperature": temperature_val,
+            "step_time_sec": step_time,
         })
 
         if step % 10 == 0:
@@ -223,7 +233,8 @@ def main():
                 f"L_v {loss_dict['img_only']:.4f} | "
                 f"L_w {loss_dict['txt_only']:.4f} | "
                 f"L_c {loss_dict['comp']:.4f} | "
-                f"Temp {temperature_val:.2f}",
+                f"Temp {temperature_val:.2f} | "
+                f"Time {step_time:.2f}s",
                 flush=True,
             )
 

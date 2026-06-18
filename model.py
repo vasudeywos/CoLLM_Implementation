@@ -140,7 +140,10 @@ class CoLLMStage1(nn.Module):
 
         self.llm = AutoModel.from_pretrained(llm_model_name, **llm_kwargs)
         if self.use_4bit:
-            self.llm = prepare_model_for_kbit_training(self.llm)
+            self.llm = prepare_model_for_kbit_training(
+                self.llm,
+                use_gradient_checkpointing=self.gradient_checkpointing,
+            )
         if self.gradient_checkpointing:
             self.llm.gradient_checkpointing_enable()
 

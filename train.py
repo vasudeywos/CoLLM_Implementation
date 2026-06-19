@@ -6,12 +6,49 @@ import time
 import torch
 from transformers import AutoTokenizer
 from torch.utils.tensorboard import SummaryWriter
+from peft import PeftModel
 
 from dataset import get_cc3m_dataloader
 from model import CoLLMStage1, resolve_attn_implementation, resolve_llm_quantization
 from loss import collm_loss
 from slerp import slerp
 from text_synthesis import get_modification_texts
+
+
+def load_training_checkpoint(model, checkpoint_dir, device):
+    extra_path = os.path.join(checkpoint_dir, "extra_modules.pt")
+    if not os.path.isfile(extra_path):
+        raise FileNotFoundError(f"Missing checkpoint extras: {extra_path}")
+
+    clip_lora_dir = os.path.join(checkpoint_dir, "clip_lora")
+    if os.path.isdir(clip_lora_dir):
+        print(f"Loading CLIP LoRA from {clip_lora_dir}")
+        model.clip.vision_model = PeftModel.from_pretrained(
+            model.clip.vision_model.base_model.model,
+            clip_lora_dir,
+            is_trainable=True,
+        )
+    else:
+        raise FileNotFoundError(f"Missing CLIP LoRA checkpoint: {clip_lora_dir}")
+
+    llm_lora_dir = os.path.join(checkpoint_dir, "llm_lora")
+    if os.path.isdir(llm_lora_dir):
+        print(f"Loading LLM LoRA from {llm_lora_dir}")
+        model.llm = PeftModel.from_pretrained(
+            model.llm.base_model.model,
+            llm_lora_dir,
+            is_trainable=True,
+        )
+    else:
+        raise FileNotFoundError(f"Missing LLM LoRA checkpoint: {llm_lora_dir}")
+
+    print(f"Loading training extras from {extra_path}")
+    extra = torch.load(extra_path, map_location="cpu")
+    model.image_adapter.load_state_dict(extra["image_adapter"])
+    model.projection.load_state_dict(extra["projection"])
+    model.logit_scale.data = extra["logit_scale"].to(device)
+    model.place_trainable_modules(device)
+    return extra
 
 
 def get_nearest_neighbors(h_prime_detached):
@@ -50,6 +87,12 @@ def main():
     parser.add_argument("--save_every", type=int, default=250)
     parser.add_argument("--log_dir", type=str, default="./logs")
     parser.add_argument("--output_dir", type=str, default="./checkpoints")
+    parser.add_argument(
+        "--resume_from",
+        type=str,
+        default=None,
+        help="Path to a checkpoint_step_* directory to resume training from.",
+    )
     parser.add_argument(
         "--llm_precision",
         type=str,
@@ -93,6 +136,7 @@ def main():
     print(f"Max steps:              {args.max_steps}")
     print(f"Save every steps:       {args.save_every}")
     print(f"Warmup ratio:           {args.warmup_ratio}")
+    print(f"Resume from:            {args.resume_from}")
 
     os.makedirs(args.log_dir, exist_ok=True)
     os.makedirs(args.output_dir, exist_ok=True)
@@ -114,6 +158,19 @@ def main():
         device=device,
     )
     model.train()
+
+    resume_extra = None
+    start_step = 0
+    if args.resume_from is not None:
+        resume_extra = load_training_checkpoint(model, args.resume_from, device)
+        if "step" not in resume_extra:
+            raise KeyError(
+                "Resume checkpoint is missing 'step'. Use a checkpoint_step_* "
+                "directory, not checkpoint_final."
+            )
+        start_step = int(resume_extra["step"]) + 1
+        print(f"Resuming training from step {start_step}")
+        model.train()
 
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
@@ -145,12 +202,30 @@ def main():
         return 1.0
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+    if resume_extra is not None:
+        if "optimizer_state_dict" not in resume_extra:
+            raise KeyError(
+                "Resume checkpoint is missing optimizer_state_dict. "
+                "Use an intermediate checkpoint_step_* checkpoint."
+            )
+        optimizer.load_state_dict(resume_extra["optimizer_state_dict"])
+        if "scheduler_state_dict" in resume_extra:
+            scheduler.load_state_dict(resume_extra["scheduler_state_dict"])
+        else:
+            scheduler.last_epoch = start_step - 1
     optimizer.zero_grad()
 
     print(f"Warmup steps:           {warmup_steps}")
+    if start_step >= args.max_steps:
+        raise ValueError(
+            f"Resume step {start_step} is already >= max_steps ({args.max_steps}). "
+            "Increase --max_steps to continue training."
+        )
     print("Starting training...")
 
-    for step, batch in enumerate(dataloader):
+    step = start_step - 1
+    for local_step, batch in enumerate(dataloader):
+        step = start_step + local_step
         if device.type == "cuda":
             torch.cuda.synchronize()
         step_start = time.perf_counter()
@@ -253,6 +328,7 @@ def main():
                     "projection": model.projection.state_dict(),
                     "logit_scale": model.logit_scale.detach().cpu(),
                     "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
                 },
                 os.path.join(ckpt_dir, "extra_modules.pt"),
             )
@@ -272,6 +348,9 @@ def main():
             "image_adapter": model.image_adapter.state_dict(),
             "projection": model.projection.state_dict(),
             "logit_scale": model.logit_scale.detach().cpu(),
+            "step": step,
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
         },
         os.path.join(final_dir, "extra_modules.pt"),
     )

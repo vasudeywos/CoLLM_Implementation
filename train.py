@@ -6,13 +6,20 @@ import time
 import torch
 from transformers import AutoTokenizer
 from torch.utils.tensorboard import SummaryWriter
-from peft import PeftModel
+from peft import set_peft_model_state_dict
+from peft.utils.save_and_load import load_peft_weights
 
 from dataset import get_cc3m_dataloader
 from model import CoLLMStage1, resolve_attn_implementation, resolve_llm_quantization
 from loss import collm_loss
 from slerp import slerp
 from text_synthesis import get_modification_texts
+
+
+def load_lora_weights(peft_model, lora_dir):
+    lora_state = load_peft_weights(lora_dir, device="cpu")
+    set_peft_model_state_dict(peft_model, lora_state, adapter_name="default")
+    peft_model.set_adapter("default")
 
 
 def load_training_checkpoint(model, checkpoint_dir, device):
@@ -23,22 +30,14 @@ def load_training_checkpoint(model, checkpoint_dir, device):
     clip_lora_dir = os.path.join(checkpoint_dir, "clip_lora")
     if os.path.isdir(clip_lora_dir):
         print(f"Loading CLIP LoRA from {clip_lora_dir}")
-        model.clip.vision_model = PeftModel.from_pretrained(
-            model.clip.vision_model.base_model.model,
-            clip_lora_dir,
-            is_trainable=True,
-        )
+        load_lora_weights(model.clip.vision_model, clip_lora_dir)
     else:
         raise FileNotFoundError(f"Missing CLIP LoRA checkpoint: {clip_lora_dir}")
 
     llm_lora_dir = os.path.join(checkpoint_dir, "llm_lora")
     if os.path.isdir(llm_lora_dir):
         print(f"Loading LLM LoRA from {llm_lora_dir}")
-        model.llm = PeftModel.from_pretrained(
-            model.llm.base_model.model,
-            llm_lora_dir,
-            is_trainable=True,
-        )
+        load_lora_weights(model.llm, llm_lora_dir)
     else:
         raise FileNotFoundError(f"Missing LLM LoRA checkpoint: {llm_lora_dir}")
 

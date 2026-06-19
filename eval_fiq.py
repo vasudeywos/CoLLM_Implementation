@@ -7,17 +7,19 @@ Gallery encoding is done live with model.encode_target() (no pre-computed .pth f
 Usage:
     python eval_fiq.py \
         --checkpoint_dir ./checkpoints_stage1_run5/checkpoint_final \
-        --fiq_image_dir  /path/to/fashioniq/images \
-        --fiq_anno_dir   /path/to/fashioniq/annotations \
+        --fiq_image_dir   /path/to/fashionIQ_dataset/images \
+        --fiq_caption_dir /path/to/fashionIQ_dataset/captions \
+        --fiq_split_dir   /path/to/fashionIQ_dataset/image_splits \
         --llm_model      Salesforce/SFR-Embedding-2_R \
         --llm_dim        4096 \
         --llm_precision  4bit \
         --attn_implementation eager \
         --batch_size     64
 
-Fashion-IQ annotation structure expected:
-    {fiq_anno_dir}/cap.{category}.val.json   — list of {candidate, target, captions:[str,str]}
-    {fiq_anno_dir}/split.{category}.val.json — list of image ids that form the gallery
+Fashion-IQ data structure expected (matches the official repo layout):
+    {fiq_caption_dir}/cap.{category}.val.json   — list of {candidate, target, captions:[str,str]}
+    {fiq_split_dir}/split.{category}.val.json   — flat list of image ids that form the gallery
+    {fiq_image_dir}/{image_id}.png (or .jpg)    — all images in one flat folder
 
 Image files: {fiq_image_dir}/{image_id}.png  (or .jpg — script tries both)
 """
@@ -40,7 +42,7 @@ from torchvision.transforms.functional import InterpolationMode
 from transformers import AutoTokenizer
 
 from model import CoLLMStage1, resolve_attn_implementation, resolve_llm_quantization
-from peft import PeftModel
+from peft import PeftModel  # noqa: F401 (kept for reference; loading uses load_adapter instead)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -191,24 +193,27 @@ def load_model(args, device):
     ckpt_dir = Path(args.checkpoint_dir)
 
     # Load CLIP LoRA weights
+    # NOTE: model.clip.vision_model is already a PeftModel from get_peft_model() at init.
+    # Re-wrapping with PeftModel.from_pretrained() stacks a second adapter on top of the
+    # randomly-initialized one instead of replacing it. Use load_adapter + set_adapter instead.
     clip_lora_dir = ckpt_dir / "clip_lora"
     if clip_lora_dir.exists():
         print(f"Loading CLIP LoRA from {clip_lora_dir}")
-        model.clip.vision_model = PeftModel.from_pretrained(
-            model.clip.vision_model.base_model.model,   # unwrap to base before re-applying
-            str(clip_lora_dir),
+        model.clip.vision_model.load_adapter(
+            str(clip_lora_dir), adapter_name="trained", is_trainable=False
         )
+        model.clip.vision_model.set_adapter("trained")
     else:
         print(f"WARNING: No clip_lora dir found at {clip_lora_dir} — using untrained CLIP")
 
-    # Load LLM LoRA weights
+    # Load LLM LoRA weights — same double-adapter issue as CLIP above
     llm_lora_dir = ckpt_dir / "llm_lora"
     if llm_lora_dir.exists():
         print(f"Loading LLM LoRA from {llm_lora_dir}")
-        model.llm = PeftModel.from_pretrained(
-            model.llm.base_model.model,
-            str(llm_lora_dir),
+        model.llm.load_adapter(
+            str(llm_lora_dir), adapter_name="trained", is_trainable=False
         )
+        model.llm.set_adapter("trained")
     else:
         print(f"WARNING: No llm_lora dir found at {llm_lora_dir} — using untrained LLM")
 
@@ -232,11 +237,12 @@ def load_model(args, device):
 
 @torch.no_grad()
 def evaluate_category(model, category: str, args, device) -> dict:
-    anno_dir  = Path(args.fiq_anno_dir)
-    img_dir   = args.fiq_image_dir
+    caption_dir = Path(args.fiq_caption_dir)
+    split_dir   = Path(args.fiq_split_dir)
+    img_dir     = args.fiq_image_dir
 
-    anno_path    = anno_dir / f"cap.{category}.val.json"
-    gallery_path = anno_dir / f"split.{category}.val.json"
+    anno_path    = caption_dir / f"cap.{category}.val.json"
+    gallery_path = split_dir / f"split.{category}.val.json"
 
     assert anno_path.exists(),    f"Missing annotation: {anno_path}"
     assert gallery_path.exists(), f"Missing gallery split: {gallery_path}"
@@ -377,8 +383,10 @@ def main():
     # FashionIQ data
     parser.add_argument("--fiq_image_dir", type=str, required=True,
                         help="Directory containing all FashionIQ images (*.png or *.jpg)")
-    parser.add_argument("--fiq_anno_dir", type=str, required=True,
-                        help="Directory containing cap.{cat}.val.json and split.{cat}.val.json")
+    parser.add_argument("--fiq_caption_dir", type=str, required=True,
+                        help="Directory containing cap.{cat}.val.json files")
+    parser.add_argument("--fiq_split_dir", type=str, required=True,
+                        help="Directory containing split.{cat}.val.json files")
 
     # Model config — must match training config
     parser.add_argument("--llm_model",          type=str,  default="Salesforce/SFR-Embedding-2_R")

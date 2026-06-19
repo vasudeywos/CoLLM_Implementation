@@ -47,6 +47,7 @@ def main():
     parser.add_argument("--logit_scale_lr", type=float, default=1e-5)
     parser.add_argument("--warmup_ratio", type=float, default=0.05)
     parser.add_argument("--max_steps", type=int, default=10000)
+    parser.add_argument("--save_every", type=int, default=250)
     parser.add_argument("--log_dir", type=str, default="./logs")
     parser.add_argument("--output_dir", type=str, default="./checkpoints")
     parser.add_argument(
@@ -90,6 +91,7 @@ def main():
     print(f"Learning rate:          {args.lr}")
     print(f"Logit scale LR:         {args.logit_scale_lr}")
     print(f"Max steps:              {args.max_steps}")
+    print(f"Save every steps:       {args.save_every}")
     print(f"Warmup ratio:           {args.warmup_ratio}")
 
     os.makedirs(args.log_dir, exist_ok=True)
@@ -238,7 +240,7 @@ def main():
                 flush=True,
             )
 
-        if step > 0 and step % 1000 == 0:
+        if step > 0 and step % args.save_every == 0:
             ckpt_dir = os.path.join(args.output_dir, f"checkpoint_step_{step}")
             os.makedirs(ckpt_dir, exist_ok=True)
 

@@ -43,6 +43,7 @@ from transformers import AutoTokenizer
 
 from model import CoLLMStage1, resolve_attn_implementation, resolve_llm_quantization
 from peft import PeftModel  # noqa: F401 (kept for reference; loading uses load_adapter instead)
+from model_stage2 import build_stage2_model
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -177,8 +178,11 @@ def get_recalls(sim: torch.Tensor, query_lbls: list, target_lbls: np.ndarray,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_model(args, device):
-    tokenizer = AutoTokenizer.from_pretrained(args.llm_model, padding_side="left")
+    if args.stage == 2:
+        return load_model_stage2(args, device)
 
+    # ── original Stage-1 load (unchanged) ────────────────────────────────────
+    tokenizer = AutoTokenizer.from_pretrained(args.llm_model, padding_side="left")
     model = CoLLMStage1(
         tokenizer=tokenizer,
         llm_model_name=args.llm_model,
@@ -189,13 +193,7 @@ def load_model(args, device):
         gradient_checkpointing=False,
         device=device,
     )
-
     ckpt_dir = Path(args.checkpoint_dir)
-
-    # Load CLIP LoRA weights
-    # NOTE: model.clip.vision_model is already a PeftModel from get_peft_model() at init.
-    # Re-wrapping with PeftModel.from_pretrained() stacks a second adapter on top of the
-    # randomly-initialized one instead of replacing it. Use load_adapter + set_adapter instead.
     clip_lora_dir = ckpt_dir / "clip_lora"
     if clip_lora_dir.exists():
         print(f"Loading CLIP LoRA from {clip_lora_dir}")
@@ -204,9 +202,7 @@ def load_model(args, device):
         )
         model.clip.vision_model.set_adapter("trained")
     else:
-        print(f"WARNING: No clip_lora dir found at {clip_lora_dir} — using untrained CLIP")
-
-    # Load LLM LoRA weights — same double-adapter issue as CLIP above
+        print(f"WARNING: No clip_lora dir found at {clip_lora_dir}")
     llm_lora_dir = ckpt_dir / "llm_lora"
     if llm_lora_dir.exists():
         print(f"Loading LLM LoRA from {llm_lora_dir}")
@@ -215,9 +211,7 @@ def load_model(args, device):
         )
         model.llm.set_adapter("trained")
     else:
-        print(f"WARNING: No llm_lora dir found at {llm_lora_dir} — using untrained LLM")
-
-    # Load adapter + projection + logit_scale
+        print(f"WARNING: No llm_lora dir found at {llm_lora_dir}")
     extra_pt = ckpt_dir / "extra_modules.pt"
     if extra_pt.exists():
         print(f"Loading adapter/projection from {extra_pt}")
@@ -227,7 +221,6 @@ def load_model(args, device):
         model.logit_scale.data = extra["logit_scale"].to(device)
     else:
         print(f"WARNING: No extra_modules.pt found at {extra_pt}")
-
     model.eval()
     return model
 
@@ -369,6 +362,55 @@ def print_mean_results(all_recalls: dict):
     r50_avg = round(np.mean([all_recalls[cat].get("R50", 0.0) for cat in FIQ_CATEGORIES]), 2)
     print(f"\nFIQ Average R10: {r10_avg:.2f}   |   FIQ Average R50: {r50_avg:.2f}")
 
+
+def load_model_stage2(args, device):
+    """Load a Stage-2 checkpoint for eval.
+    Stage-2 checkpoint dir contains:
+        llm_lora_stage2/   — rank-16 LLM LoRA
+        extra_modules.pt   — image_adapter, projection, logit_scale
+    Requires --merged_dir pointing to the merged Stage-1 base weights.
+    """
+    tokenizer = AutoTokenizer.from_pretrained(args.llm_model, padding_side="left")
+
+    model = build_stage2_model(
+        tokenizer=tokenizer,
+        merged_dir=args.merged_dir,
+        llm_dim=args.llm_dim,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_rank,   # alpha == rank per paper Sec 9.2
+        llm_precision=args.llm_precision,
+        attn_implementation=args.attn_implementation,
+        gradient_checkpointing=False,
+        device=device,
+    )
+
+    ckpt_dir = Path(args.checkpoint_dir)
+
+    # Load Stage-2 LLM LoRA
+    llm_lora_dir = ckpt_dir / "llm_lora_stage2"
+    if llm_lora_dir.exists():
+        print(f"Loading Stage-2 LLM LoRA from {llm_lora_dir}")
+        model.llm.load_adapter(
+            str(llm_lora_dir), adapter_name="trained", is_trainable=False
+        )
+        model.llm.set_adapter("trained")
+    else:
+        print(f"WARNING: No llm_lora_stage2 dir at {llm_lora_dir} — using merged base weights only")
+
+    # Load image_adapter / projection / logit_scale
+    extra_pt = ckpt_dir / "extra_modules.pt"
+    if extra_pt.exists():
+        print(f"Loading adapter/projection from {extra_pt}")
+        extra = torch.load(extra_pt, map_location="cpu", weights_only=True)
+        model.image_adapter.load_state_dict(extra["image_adapter"])
+        model.projection.load_state_dict(extra["projection"])
+        model.logit_scale.data = extra["logit_scale"].to(device)
+    else:
+        print(f"WARNING: No extra_modules.pt at {extra_pt}")
+
+    model.eval()
+    return model
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
@@ -402,8 +444,18 @@ def main():
                         help="Which categories to evaluate (default: all three)")
     parser.add_argument("--output_json",        type=str,  default="fiq_zeroshot_results.json",
                         help="Where to save the recall numbers as JSON")
+    # Stage selector
+    parser.add_argument("--stage", type=int, default=1, choices=[1, 2],
+                        help="1 = Stage-1 checkpoint, 2 = Stage-2 checkpoint")
+
+    # Required for Stage-2 only — merged base weights dir
+    parser.add_argument("--merged_dir", type=str, default=None,
+                        help="Stage-2 only: path to merged_for_stage2 dir "
+                            "(output of merge_stage1.py)")
 
     args = parser.parse_args()
+    if args.stage == 2 and args.merged_dir is None:
+        parser.error("--merged_dir is required when --stage 2")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 

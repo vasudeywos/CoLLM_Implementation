@@ -101,11 +101,10 @@ def load_training_checkpoint(model, checkpoint_dir, device):
     model.place_trainable_modules(device)
     return extra
 
-def load_lora_for_init(model, checkpoint_dir, device):
-    """Load Stage-2 LoRA + bridge weights from a previous run.
-    Resets step/optimizer — use for chaining chunk runs, not resuming."""
+def load_lora_for_init(model, checkpoint_dir, device, optimizer=None, scheduler=None):
     ckpt = Path(checkpoint_dir)
-    
+
+    # Load LoRA weights
     llm_lora_dir = ckpt / "llm_lora_stage2"
     if llm_lora_dir.exists():
         print(f"Init: loading LLM LoRA from {llm_lora_dir}")
@@ -113,18 +112,28 @@ def load_lora_for_init(model, checkpoint_dir, device):
         from peft import set_peft_model_state_dict
         lora_state = load_peft_weights(str(llm_lora_dir), device="cpu")
         set_peft_model_state_dict(model.llm, lora_state, adapter_name="default")
-    else:
-        print(f"WARNING: no llm_lora_stage2 at {llm_lora_dir}")
+        model.llm.set_adapter("default")
 
+    # Load bridge weights
     extra_pt = ckpt / "extra_modules.pt"
     if extra_pt.exists():
-        print(f"Init: loading adapter/projection from {extra_pt}")
         extra = torch.load(extra_pt, map_location="cpu")
         model.image_adapter.load_state_dict(extra["image_adapter"])
         model.projection.load_state_dict(extra["projection"])
         model.logit_scale.data = extra["logit_scale"].to(device)
-    else:
-        print(f"WARNING: no extra_modules.pt at {extra_pt}")
+
+        # Restore optimizer and scheduler if provided
+        if optimizer is not None and "optimizer_state_dict" in extra:
+            optimizer.load_state_dict(extra["optimizer_state_dict"])
+            print(f"Init: optimizer state restored from {extra_pt}")
+        else:
+            print(f"Init: optimizer state NOT restored (not found or not requested)")
+
+        if scheduler is not None and "scheduler_state_dict" in extra:
+            scheduler.load_state_dict(extra["scheduler_state_dict"])
+            # Reset last_epoch to 0 — new chunk is a fresh epoch
+            scheduler.last_epoch = 0
+            print(f"Init: scheduler state restored, last_epoch reset to 0")
 
 
 def main():
@@ -195,11 +204,6 @@ def main():
         device=device,
     )
 
-    # After model is built, before optimizer setup
-    if args.init_from is not None and args.resume_from is None:
-        load_lora_for_init(model, args.init_from, device)
-        print(f"Initialized weights from {args.init_from} — step counter reset to 0")
-
     model.train()
     model.clip.eval()  # frozen vision encoder always stays in eval mode
     resume_extra = None
@@ -269,6 +273,19 @@ def main():
         return 1.0
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+    if args.init_from is not None and args.resume_from is None:
+        load_lora_for_init(
+            model,
+            args.init_from,
+            device,
+            optimizer=optimizer,
+            scheduler=scheduler,
+        )
+        print(
+            f"Initialized from {args.init_from} with optimizer state carried over; "
+            "step counter reset to 0"
+        )
+
     if resume_extra is not None:
         if "optimizer_state_dict" not in resume_extra:
             raise KeyError(

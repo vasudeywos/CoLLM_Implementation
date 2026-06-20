@@ -100,6 +100,31 @@ def load_training_checkpoint(model, checkpoint_dir, device):
     model.place_trainable_modules(device)
     return extra
 
+def load_lora_for_init(model, checkpoint_dir, device):
+    """Load Stage-2 LoRA + bridge weights from a previous run.
+    Resets step/optimizer — use for chaining chunk runs, not resuming."""
+    ckpt = Path(checkpoint_dir)
+    
+    llm_lora_dir = ckpt / "llm_lora_stage2"
+    if llm_lora_dir.exists():
+        print(f"Init: loading LLM LoRA from {llm_lora_dir}")
+        from peft.utils.save_and_load import load_peft_weights
+        from peft import set_peft_model_state_dict
+        lora_state = load_peft_weights(str(llm_lora_dir), device="cpu")
+        set_peft_model_state_dict(model.llm, lora_state, adapter_name="default")
+    else:
+        print(f"WARNING: no llm_lora_stage2 at {llm_lora_dir}")
+
+    extra_pt = ckpt / "extra_modules.pt"
+    if extra_pt.exists():
+        print(f"Init: loading adapter/projection from {extra_pt}")
+        extra = torch.load(extra_pt, map_location="cpu")
+        model.image_adapter.load_state_dict(extra["image_adapter"])
+        model.projection.load_state_dict(extra["projection"])
+        model.logit_scale.data = extra["logit_scale"].to(device)
+    else:
+        print(f"WARNING: no extra_modules.pt at {extra_pt}")
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -140,6 +165,10 @@ def main():
     parser.add_argument("--llm_precision", type=str, default="auto", choices=["auto", "4bit", "bf16"])
     parser.add_argument("--attn_implementation", type=str, default="eager", choices=["auto", "sdpa", "eager"])
     parser.add_argument("--gradient_checkpointing", action="store_true")
+    parser.add_argument("--init_from", type=str, default=None,
+                    help="Load LoRA + adapter/projection weights from a previous "
+                         "Stage-2 checkpoint but reset step counter. "
+                         "Use this to chain chunk runs.")
     args = parser.parse_args()
 
     if args.batch_size % args.llm_micro_batch != 0:
@@ -164,6 +193,12 @@ def main():
         gradient_checkpointing=args.gradient_checkpointing,
         device=device,
     )
+
+    # After model is built, before optimizer setup
+    if args.init_from is not None and args.resume_from is None:
+        load_lora_for_init(model, args.init_from, device)
+        print(f"Initialized weights from {args.init_from} — step counter reset to 0")
+
     model.train()
     model.clip.eval()  # frozen vision encoder always stays in eval mode
     resume_extra = None

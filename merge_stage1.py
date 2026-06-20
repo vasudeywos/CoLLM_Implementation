@@ -44,7 +44,7 @@ import shutil
 from pathlib import Path
 
 import torch
-from transformers import AutoModel, CLIPModel
+from transformers import AutoModel, AutoTokenizer, CLIPModel
 from peft import PeftModel
 
 
@@ -77,6 +77,7 @@ def merge_llm(stage1_dir: Path, llm_model_name: str, output_dir: Path, device: t
     llm_lora_dir = stage1_dir / "llm_lora"
     merge_dtype = resolve_merge_dtype(device)
     print(f"Loading base LLM in {merge_dtype}: {llm_model_name}")
+    tokenizer = AutoTokenizer.from_pretrained(llm_model_name, padding_side="left")
     load_kwargs = {"torch_dtype": merge_dtype}
     if device.type == "cuda":
         # One-time merge, no optimizer states needed — a ~7B model fits
@@ -84,6 +85,11 @@ def merge_llm(stage1_dir: Path, llm_model_name: str, output_dir: Path, device: t
         load_kwargs["device_map"] = {"": device.index or 0}
     # NOTE: deliberately NOT 4-bit here — merging LoRA into a 4-bit base is unreliable.
     llm = AutoModel.from_pretrained(llm_model_name, **load_kwargs)
+    image_token = "<image>"
+    if image_token not in tokenizer.get_vocab():
+        tokenizer.add_tokens([image_token])
+    if len(tokenizer) != llm.get_input_embeddings().weight.shape[0]:
+        llm.resize_token_embeddings(len(tokenizer))
 
     if not llm_lora_dir.exists():
         print(f"WARNING: no llm_lora dir at {llm_lora_dir} — saving base LLM unmerged.")

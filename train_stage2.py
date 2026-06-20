@@ -35,6 +35,8 @@ import torch
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoTokenizer
+from peft import set_peft_model_state_dict
+from peft.utils.save_and_load import load_peft_weights
 
 from dataset_stage2 import get_triplet_dataloader
 from model_stage2 import build_stage2_model
@@ -55,7 +57,7 @@ def collm_single_contrastive_loss(c, z, logit_scale):
     return loss, temp.item()
 
 
-def save_checkpoint(model, output_dir, name, optimizer, step, final=False):
+def save_checkpoint(model, output_dir, name, optimizer, scheduler, step):
     ckpt_dir = os.path.join(output_dir, name)
     os.makedirs(ckpt_dir, exist_ok=True)
     # Only the LLM has LoRA adapters in Stage-2; CLIP is a plain frozen model.
@@ -65,11 +67,38 @@ def save_checkpoint(model, output_dir, name, optimizer, step, final=False):
         "projection": model.projection.state_dict(),
         "logit_scale": model.logit_scale.detach().cpu(),
     }
-    if not final and optimizer is not None:
-        extra["step"] = step
+    extra["step"] = step
+    if optimizer is not None:
         extra["optimizer_state_dict"] = optimizer.state_dict()
+        if scheduler is not None:
+            extra["scheduler_state_dict"] = scheduler.state_dict()
     torch.save(extra, os.path.join(ckpt_dir, "extra_modules.pt"))
     print(f"Saved checkpoint -> {ckpt_dir}")
+
+
+def load_lora_weights(peft_model, lora_dir):
+    lora_state = load_peft_weights(lora_dir, device="cpu")
+    set_peft_model_state_dict(peft_model, lora_state, adapter_name="default")
+    peft_model.set_adapter("default")
+
+
+def load_training_checkpoint(model, checkpoint_dir, device):
+    llm_lora_dir = os.path.join(checkpoint_dir, "llm_lora_stage2")
+    if not os.path.isdir(llm_lora_dir):
+        raise FileNotFoundError(f"Missing Stage-2 LLM LoRA checkpoint: {llm_lora_dir}")
+    print(f"Loading Stage-2 LLM LoRA from {llm_lora_dir}")
+    load_lora_weights(model.llm, llm_lora_dir)
+
+    extra_path = os.path.join(checkpoint_dir, "extra_modules.pt")
+    if not os.path.isfile(extra_path):
+        raise FileNotFoundError(f"Missing checkpoint extras: {extra_path}")
+    print(f"Loading Stage-2 extras from {extra_path}")
+    extra = torch.load(extra_path, map_location="cpu")
+    model.image_adapter.load_state_dict(extra["image_adapter"])
+    model.projection.load_state_dict(extra["projection"])
+    model.logit_scale.data = extra["logit_scale"].to(device)
+    model.place_trainable_modules(device)
+    return extra
 
 
 def main():
@@ -102,6 +131,12 @@ def main():
     parser.add_argument("--save_every", type=int, default=250)
     parser.add_argument("--log_dir", type=str, default="./logs_stage2")
     parser.add_argument("--output_dir", type=str, default="./checkpoints_stage2")
+    parser.add_argument(
+        "--resume_from",
+        type=str,
+        default=None,
+        help="Path to a Stage-2 checkpoint_step_* directory to resume training from.",
+    )
     parser.add_argument("--llm_precision", type=str, default="auto", choices=["auto", "4bit", "bf16"])
     parser.add_argument("--attn_implementation", type=str, default="eager", choices=["auto", "sdpa", "eager"])
     parser.add_argument("--gradient_checkpointing", action="store_true")
@@ -131,6 +166,20 @@ def main():
     )
     model.train()
     model.clip.eval()  # frozen vision encoder always stays in eval mode
+    resume_extra = None
+    start_step = 0
+    if args.resume_from is not None:
+        resume_extra = load_training_checkpoint(model, args.resume_from, device)
+        if "step" not in resume_extra:
+            raise KeyError(
+                "Resume checkpoint is missing 'step'. Use a checkpoint_step_* "
+                "directory, not checkpoint_final."
+            )
+        start_step = int(resume_extra["step"]) + 1
+        print(f"Resuming Stage-2 training from step {start_step}")
+        model.train()
+        model.clip.eval()
+
     trainable_params = [
         p
         for p in model.parameters()
@@ -184,11 +233,32 @@ def main():
         return 1.0
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+    if resume_extra is not None:
+        if "optimizer_state_dict" not in resume_extra:
+            raise KeyError(
+                "Resume checkpoint is missing optimizer_state_dict. "
+                "Use a Stage-2 checkpoint_step_* checkpoint."
+            )
+        optimizer.load_state_dict(resume_extra["optimizer_state_dict"])
+        if "scheduler_state_dict" in resume_extra:
+            scheduler.load_state_dict(resume_extra["scheduler_state_dict"])
+        else:
+            scheduler.last_epoch = start_step - 1
 
-    step = 0
+    if start_step >= max_steps:
+        raise ValueError(
+            f"Resume step {start_step} is already >= total steps ({max_steps}). "
+            "Increase --epochs to continue training."
+        )
+
+    step = start_step
     step_logs = []
-    for epoch in range(args.epochs):
+    start_epoch = start_step // steps_per_epoch
+    for epoch in range(start_epoch, args.epochs):
         for batch in dataloader:
+            if step < start_step:
+                step += 1
+                continue
             if device.type == "cuda":
                 torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -246,11 +316,27 @@ def main():
                       f"Time {step_time:.2f}s", flush=True)
 
             if step > 0 and step % args.save_every == 0:
-                save_checkpoint(model, args.output_dir, f"checkpoint_step_{step}", optimizer, step)
+                save_checkpoint(
+                    model,
+                    args.output_dir,
+                    f"checkpoint_step_{step}",
+                    optimizer,
+                    scheduler,
+                    step,
+                )
 
             step += 1
+            if step >= max_steps:
+                break
 
-    save_checkpoint(model, args.output_dir, "checkpoint_final", optimizer=None, step=step, final=True)
+    save_checkpoint(
+        model,
+        args.output_dir,
+        "checkpoint_final",
+        optimizer=optimizer,
+        scheduler=scheduler,
+        step=step,
+    )
     with open(os.path.join(args.log_dir, "training_logs.json"), "w") as f:
         json.dump(step_logs, f, indent=4)
     writer.close()

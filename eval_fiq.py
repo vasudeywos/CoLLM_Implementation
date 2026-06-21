@@ -195,7 +195,7 @@ def load_model(args, device):
     )
     ckpt_dir = Path(args.checkpoint_dir)
     clip_lora_dir = ckpt_dir / "clip_lora"
-    if clip_lora_dir.exists():
+    if clip_lora_dir.exists() and not args.skip_clip_lora:
         print(f"Loading CLIP LoRA from {clip_lora_dir}")
         model.clip.vision_model.load_adapter(
             str(clip_lora_dir), adapter_name="trained", is_trainable=False
@@ -204,7 +204,7 @@ def load_model(args, device):
     else:
         print(f"WARNING: No clip_lora dir found at {clip_lora_dir}")
     llm_lora_dir = ckpt_dir / "llm_lora"
-    if llm_lora_dir.exists():
+    if llm_lora_dir.exists() and not args.skip_llm_lora:
         print(f"Loading LLM LoRA from {llm_lora_dir}")
         model.llm.load_adapter(
             str(llm_lora_dir), adapter_name="trained", is_trainable=False
@@ -452,6 +452,9 @@ def main():
     parser.add_argument("--merged_dir", type=str, default=None,
                         help="Stage-2 only: path to merged_for_stage2 dir "
                             "(output of merge_stage1.py)")
+    
+    parser.add_argument("--skip_clip_lora", action="store_true")
+    parser.add_argument("--skip_llm_lora", action="store_true")
 
     args = parser.parse_args()
     if args.stage == 2 and args.merged_dir is None:

@@ -1,8 +1,5 @@
 import random
 
-
-# Paper Section 7.1: all 15 templates
-# w_i = target caption, w_j = neighbor caption
 MODIFICATION_TEMPLATES = [
     "show {wi} instead of {wj}",
     "{wi} instead of {wj}",

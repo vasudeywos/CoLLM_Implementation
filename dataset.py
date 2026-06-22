@@ -37,7 +37,7 @@ def preprocess(sample):
         "captions": caption
     }
 
-def get_cc3m_dataloader(tar_path_pattern, batch_size=64, num_workers=8):
+def get_cc3m_dataloader(tar_path_pattern, batch_size=64, num_workers=6):
     dataset = (
         wds.WebDataset(tar_path_pattern,
                         resampled=True,

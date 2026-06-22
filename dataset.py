@@ -38,9 +38,6 @@ def preprocess(sample):
     }
 
 def get_cc3m_dataloader(tar_path_pattern, batch_size=64, num_workers=4):
-    """
-    tar_path_pattern should be e.g., "/path/to/cc3m_downloaded_80k_224/{00000..00011}.tar"
-    """
     dataset = (
         wds.WebDataset(tar_path_pattern,
                         resampled=True,
@@ -52,6 +49,5 @@ def get_cc3m_dataloader(tar_path_pattern, batch_size=64, num_workers=4):
         .batched(batch_size, partial=False, collation_fn=default_collate)
     )
     
-    # Webdataset natively handles batching, so batch_size in DataLoader is None
     loader = torch.utils.data.DataLoader(dataset, batch_size=None, num_workers=num_workers)
     return loader

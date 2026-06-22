@@ -2,7 +2,6 @@
 eval_fiq.py — Zero-shot Recall@10 on Fashion-IQ for CoLLM Stage-1
 
 Adapted recall logic from WebCoVR (src/test/blip2/fashioniq.py).
-Gallery encoding is done live with model.encode_target() (no pre-computed .pth files needed).
 
 Usage:
     python eval_fiq.py \
@@ -15,13 +14,6 @@ Usage:
         --llm_precision  4bit \
         --attn_implementation eager \
         --batch_size     64
-
-Fashion-IQ data structure expected (matches the official repo layout):
-    {fiq_caption_dir}/cap.{category}.val.json   — list of {candidate, target, captions:[str,str]}
-    {fiq_split_dir}/split.{category}.val.json   — flat list of image ids that form the gallery
-    {fiq_image_dir}/{image_id}.png (or .jpg)    — all images in one flat folder
-
-Image files: {fiq_image_dir}/{image_id}.png  (or .jpg — script tries both)
 """
 
 import argparse
@@ -41,22 +33,16 @@ from torchvision import transforms
 from torchvision.transforms.functional import InterpolationMode
 from transformers import AutoTokenizer
 
-from model import CoLLMStage1, resolve_attn_implementation, resolve_llm_quantization
-from peft import PeftModel  # noqa: F401 (kept for reference; loading uses load_adapter instead)
+from model import CoLLMStage1
+from peft import PeftModel  
 from model_stage2 import build_stage2_model
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Constants
-# ─────────────────────────────────────────────────────────────────────────────
 
 CLIP_MEAN = [0.48145466, 0.4578275, 0.40821073]
 CLIP_STD  = [0.26862954, 0.26130258, 0.27577711]
 
 FIQ_CATEGORIES = ["dress", "shirt", "toptee"]
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Image transform — 224px to match your CLIP training setup
-# ─────────────────────────────────────────────────────────────────────────────
 
 eval_transform = transforms.Compose([
     transforms.Resize(224, interpolation=InterpolationMode.BICUBIC),
@@ -65,9 +51,6 @@ eval_transform = transforms.Compose([
     transforms.Normalize(mean=CLIP_MEAN, std=CLIP_STD),
 ])
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Caption preprocessing — adopted from WebCoVR's src/data/utils.py
-# ─────────────────────────────────────────────────────────────────────────────
 
 def pre_caption(caption: str, max_words: int = 30) -> str:
     caption = re.sub(r"([.!\"()*#:;~])", " ", caption.lower())
@@ -77,12 +60,8 @@ def pre_caption(caption: str, max_words: int = 30) -> str:
         caption = " ".join(words[:max_words])
     return caption
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Dataset
-# ─────────────────────────────────────────────────────────────────────────────
 
 def find_image(img_dir: Path, image_id: str) -> Path:
-    """Try .png then .jpg — FashionIQ ships as .png but some mirrors use .jpg."""
     for ext in [".png", ".jpg", ".jpeg"]:
         p = img_dir / f"{image_id}{ext}"
         if p.exists():
@@ -91,14 +70,6 @@ def find_image(img_dir: Path, image_id: str) -> Path:
 
 
 class FashionIQQueryDataset(Dataset):
-    """
-    Returns one item per query pair:
-        ref_img   : [3, 224, 224] tensor
-        caption   : joined + cleaned modification text  (two captions merged)
-        pair_id   : int index
-        target_id : str  (ground-truth target image id)
-        ref_id    : str  (reference image id — used to mask ref==target in sim matrix)
-    """
     def __init__(self, annotation_path: str, img_dir: str):
         self.annotation = json.load(open(annotation_path))
         self.img_dir = Path(img_dir)
@@ -139,10 +110,6 @@ class FashionIQGalleryDataset(Dataset):
         img = Image.open(find_image(self.img_dir, img_id)).convert("RGB")
         return eval_transform(img), img_id
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Recall helpers — directly adopted from WebCoVR's fashioniq.py
-# ─────────────────────────────────────────────────────────────────────────────
-
 def recall_at_k(sim: torch.Tensor, query_lbls: list, target_lbls: np.ndarray, k: int) -> float:
     """
     sim        : [N_queries, N_gallery] cosine similarity matrix (higher = more similar)
@@ -151,16 +118,16 @@ def recall_at_k(sim: torch.Tensor, query_lbls: list, target_lbls: np.ndarray, k:
     k          : cutoff
     Returns Recall@k as a percentage (0–100).
     """
-    # Sort descending by similarity (most similar first)
-    sorted_indices = torch.argsort(sim, dim=-1, descending=True).cpu()
-    sorted_names   = target_lbls[sorted_indices.numpy()]          # [N_q, N_gallery]
 
-    query_lbls_arr = np.array(query_lbls)                         # [N_q]
-    # labels[i,j] = True if sorted_names[i,j] == ground truth for query i
+    sorted_indices = torch.argsort(sim, dim=-1, descending=True).cpu()
+    sorted_names   = target_lbls[sorted_indices.numpy()]        
+
+    query_lbls_arr = np.array(query_lbls)                       
+
     labels = torch.tensor(
         sorted_names == np.repeat(query_lbls_arr, len(target_lbls)).reshape(len(query_lbls), -1)
     )
-    # Sanity: every query has exactly one correct match
+
     assert torch.equal(
         torch.sum(labels, dim=-1).int(),
         torch.ones(len(query_lbls)).int()
@@ -173,15 +140,11 @@ def get_recalls(sim: torch.Tensor, query_lbls: list, target_lbls: np.ndarray,
                 ks=(1, 5, 10, 50)) -> dict:
     return {f"R{k}": recall_at_k(sim, query_lbls, target_lbls, k) for k in ks}
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Model loading
-# ─────────────────────────────────────────────────────────────────────────────
 
 def load_model(args, device):
     if args.stage == 2:
         return load_model_stage2(args, device)
 
-    # ── original Stage-1 load (unchanged) ────────────────────────────────────
     tokenizer = AutoTokenizer.from_pretrained(args.llm_model, padding_side="left")
     model = CoLLMStage1(
         tokenizer=tokenizer,
@@ -223,10 +186,6 @@ def load_model(args, device):
         print(f"WARNING: No extra_modules.pt found at {extra_pt}")
     model.eval()
     return model
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Per-category evaluation
-# ─────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
 def evaluate_category(model, category: str, args, device) -> dict:
@@ -462,14 +421,12 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # ── Load model ────────────────────────────────────────────────────────────
     t0 = time.time()
     print("Loading model...")
     model = load_model(args, device)
     model.eval()
     print(f"Model loaded in {time.time()-t0:.1f}s")
 
-    # ── Evaluate each category ────────────────────────────────────────────────
     all_recalls = {}
     total_start = time.time()
 
@@ -480,13 +437,11 @@ def main():
         elapsed   = str(datetime.timedelta(seconds=int(time.time() - cat_start)))
         print(f"[{category.upper()}] Done in {elapsed}")
 
-    # ── Print summary ─────────────────────────────────────────────────────────
     print_mean_results(all_recalls)
 
     total_elapsed = str(datetime.timedelta(seconds=int(time.time() - total_start)))
     print(f"\nTotal evaluation time: {total_elapsed}")
 
-    # ── Save JSON ─────────────────────────────────────────────────────────────
     import json as _json
     with open(args.output_json, "w") as f:
         _json.dump(all_recalls, f, indent=2)

@@ -234,8 +234,7 @@ def main():
         captions = batch["captions"]
 
         # --- Full-batch CLIP path (never micro-batched) ---
-        with torch.no_grad():
-            z = model.encode_target(target_images)          # [B, 768]
+        z = model.encode_target(target_images)              # [B, 768]
 
         h_prime = model.encode_reference(aug_images)        # [B, 1024]
 

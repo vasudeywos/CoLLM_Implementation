@@ -10,7 +10,7 @@ This keeps the paper's CIR-triplet formulation:
 Unlike the paper's Stage-2 fine-tuning, this model does not require a Stage-1
 checkpoint. It starts from the base CLIP and SFR models and trains:
 
-  * LoRA on the CLIP vision transformer
+  * optional LoRA on the CLIP vision transformer
   * LoRA on SFR-Embedding-2_R
   * the full image adapter
   * the full output projection
@@ -111,6 +111,7 @@ class CoLLMStage3(nn.Module):
         llm_precision: str = "auto",
         attn_implementation: str = "auto",
         gradient_checkpointing: bool = False,
+        freeze_clip_lora: bool = False,
         device=None,
     ):
         super().__init__()
@@ -118,6 +119,7 @@ class CoLLMStage3(nn.Module):
         self.use_4bit = resolve_llm_quantization(llm_precision)
         self.compute_dtype = resolve_compute_dtype(device)
         self.gradient_checkpointing = gradient_checkpointing
+        self.clip_lora_frozen = freeze_clip_lora
 
         # CLIP base stays frozen; LoRA is attached only to the vision tower.
         self.clip = CLIPModel.from_pretrained(clip_model_name)
@@ -136,6 +138,7 @@ class CoLLMStage3(nn.Module):
         # The fixed CLIP visual projection defines the target retrieval space.
         for parameter in self.clip.visual_projection.parameters():
             parameter.requires_grad = False
+        self.set_clip_lora_trainable(not freeze_clip_lora)
 
         attn_impl = resolve_attn_implementation(attn_implementation)
         llm_kwargs = {
@@ -195,6 +198,12 @@ class CoLLMStage3(nn.Module):
         self.logit_scale.data = self.logit_scale.data.to(device)
         if not self.use_4bit:
             self.llm.to(device)
+
+    def set_clip_lora_trainable(self, trainable: bool):
+        for name, parameter in self.clip.vision_model.named_parameters():
+            if "lora_" in name:
+                parameter.requires_grad = trainable
+        self.clip_lora_frozen = not trainable
 
     @property
     def llm_device(self):
@@ -289,6 +298,7 @@ def build_stage3_model(
     llm_precision="auto",
     attn_implementation="eager",
     gradient_checkpointing=False,
+    freeze_clip_lora=False,
     device=None,
 ):
     return CoLLMStage3(
@@ -303,5 +313,6 @@ def build_stage3_model(
         llm_precision=llm_precision,
         attn_implementation=attn_implementation,
         gradient_checkpointing=gradient_checkpointing,
+        freeze_clip_lora=freeze_clip_lora,
         device=device,
     )

@@ -2,7 +2,7 @@
 Train CoLLM directly on MTCIR triplets from base CLIP and SFR models.
 
 Trainable components:
-  * CLIP vision LoRA
+  * optional CLIP vision LoRA
   * SFR LLM LoRA
   * image adapter
   * output projection
@@ -116,10 +116,21 @@ def main():
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--llm_micro_batch", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument(
+        "--train_clip_lora_from_start",
+        action="store_true",
+        help="Opt out of the safer default and train CLIP LoRA from step 0.",
+    )
+    parser.add_argument(
+        "--unfreeze_clip_at_step",
+        type=int,
+        default=None,
+        help="Global step at which to unfreeze CLIP LoRA after starting frozen.",
+    )
 
     # Separate rates prevent the random bridge from learning at the same
     # conservative rate used for pretrained CLIP/SFR representations.
-    parser.add_argument("--bridge_lr", type=float, default=1e-4)
+    parser.add_argument("--bridge_lr", type=float, default=5e-5)
     parser.add_argument("--llm_lora_lr", type=float, default=5e-5)
     parser.add_argument("--clip_lora_lr", type=float, default=1e-5)
     parser.add_argument("--logit_scale_lr", type=float, default=1e-5)
@@ -149,6 +160,8 @@ def main():
 
     if args.batch_size % args.llm_micro_batch != 0:
         raise ValueError("batch_size must be divisible by llm_micro_batch")
+    if args.unfreeze_clip_at_step is not None and args.unfreeze_clip_at_step < 0:
+        raise ValueError("unfreeze_clip_at_step must be >= 0")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(args.log_dir, exist_ok=True)
@@ -171,6 +184,7 @@ def main():
         llm_precision=args.llm_precision,
         attn_implementation=args.attn_implementation,
         gradient_checkpointing=args.gradient_checkpointing,
+        freeze_clip_lora=(not args.train_clip_lora_from_start),
         device=device,
     )
     model.train()
@@ -195,6 +209,12 @@ def main():
     bridge_params = [
         *model.image_adapter.parameters(),
         *model.projection.parameters(),
+    ]
+    all_trainable_params = [
+        *clip_lora_params,
+        *llm_lora_params,
+        *bridge_params,
+        model.logit_scale,
     ]
 
     optimizer = torch.optim.AdamW(
@@ -239,11 +259,12 @@ def main():
         scheduler.load_state_dict(extra["scheduler_state_dict"])
         start_step = int(extra["step"]) + 1
         print(f"Resuming from global step {start_step}")
+        if not args.train_clip_lora_from_start:
+            model.set_clip_lora_trainable(False)
 
-    trainable_parameters = [
-        parameter for parameter in model.parameters() if parameter.requires_grad
-    ]
-    trainable_count = sum(parameter.numel() for parameter in trainable_parameters)
+    trainable_count = sum(
+        parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+    )
     total_count = sum(parameter.numel() for parameter in model.parameters())
     print(f"Device: {device}")
     print(f"Triplets: {len(dataloader.dataset):,}")
@@ -259,6 +280,16 @@ def main():
         f"bridge={sum(p.numel() for p in bridge_params):,}, "
         "logit_scale=1"
     )
+    if model.clip_lora_frozen:
+        if args.unfreeze_clip_at_step is None:
+            print("CLIP LoRA schedule: frozen for entire run")
+        else:
+            print(
+                "CLIP LoRA schedule: "
+                f"frozen until global step {args.unfreeze_clip_at_step}"
+            )
+    else:
+        print("CLIP LoRA schedule: trainable from step 0")
 
     global_step = 0
     training_logs = []
@@ -269,6 +300,16 @@ def main():
             global_step = epoch * steps_per_epoch + batch_index
             if global_step < start_step:
                 continue
+            if (
+                model.clip_lora_frozen
+                and args.unfreeze_clip_at_step is not None
+                and global_step >= args.unfreeze_clip_at_step
+            ):
+                model.set_clip_lora_trainable(True)
+                print(
+                    f"Unfroze CLIP LoRA at global step {global_step}",
+                    flush=True,
+                )
 
             if device.type == "cuda":
                 torch.cuda.synchronize()
@@ -298,7 +339,7 @@ def main():
 
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(
-                trainable_parameters,
+                all_trainable_params,
                 max_norm=args.max_grad_norm,
                 error_if_nonfinite=False,
             )

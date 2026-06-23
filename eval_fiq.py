@@ -36,6 +36,7 @@ from transformers import AutoTokenizer
 from model import CoLLMStage1
 from peft import PeftModel  
 from model_stage2 import build_stage2_model
+from model_stage3 import build_stage3_model
 
 
 CLIP_MEAN = [0.48145466, 0.4578275, 0.40821073]
@@ -144,6 +145,8 @@ def get_recalls(sim: torch.Tensor, query_lbls: list, target_lbls: np.ndarray,
 def load_model(args, device):
     if args.stage == 2:
         return load_model_stage2(args, device)
+    if args.stage == 3:
+        return load_model_stage3(args, device)
 
     tokenizer = AutoTokenizer.from_pretrained(args.llm_model, padding_side="left")
     model = CoLLMStage1(
@@ -370,6 +373,69 @@ def load_model_stage2(args, device):
     model.eval()
     return model
 
+
+def load_model_stage3(args, device):
+    """Load a Stage-3 direct-training checkpoint for eval.
+    Stage-3 checkpoint dir contains:
+        clip_lora/       — optional CLIP vision LoRA
+        llm_lora/        — SFR LoRA
+        extra_modules.pt — image_adapter, projection, logit_scale
+    """
+    tokenizer = AutoTokenizer.from_pretrained(args.llm_model, padding_side="left")
+    clip_lora_rank = args.clip_lora_rank or args.lora_rank
+    llm_lora_rank = args.llm_lora_rank or args.lora_rank
+
+    model = build_stage3_model(
+        tokenizer=tokenizer,
+        clip_model_name=args.clip_model,
+        llm_model_name=args.llm_model,
+        clip_dim=args.clip_dim,
+        llm_dim=args.llm_dim,
+        embed_dim=args.embed_dim,
+        clip_lora_rank=clip_lora_rank,
+        llm_lora_rank=llm_lora_rank,
+        llm_precision=args.llm_precision,
+        attn_implementation=args.attn_implementation,
+        gradient_checkpointing=False,
+        freeze_clip_lora=True,
+        device=device,
+    )
+
+    ckpt_dir = Path(args.checkpoint_dir)
+
+    clip_lora_dir = ckpt_dir / "clip_lora"
+    if clip_lora_dir.exists() and not args.skip_clip_lora:
+        print(f"Loading Stage-3 CLIP LoRA from {clip_lora_dir}")
+        model.clip.vision_model.load_adapter(
+            str(clip_lora_dir), adapter_name="trained", is_trainable=False
+        )
+        model.clip.vision_model.set_adapter("trained")
+    else:
+        print(f"WARNING: No Stage-3 clip_lora dir found at {clip_lora_dir}")
+
+    llm_lora_dir = ckpt_dir / "llm_lora"
+    if llm_lora_dir.exists() and not args.skip_llm_lora:
+        print(f"Loading Stage-3 LLM LoRA from {llm_lora_dir}")
+        model.llm.load_adapter(
+            str(llm_lora_dir), adapter_name="trained", is_trainable=False
+        )
+        model.llm.set_adapter("trained")
+    else:
+        print(f"WARNING: No Stage-3 llm_lora dir found at {llm_lora_dir}")
+
+    extra_pt = ckpt_dir / "extra_modules.pt"
+    if extra_pt.exists():
+        print(f"Loading Stage-3 adapter/projection from {extra_pt}")
+        extra = torch.load(extra_pt, map_location="cpu", weights_only=True)
+        model.image_adapter.load_state_dict(extra["image_adapter"])
+        model.projection.load_state_dict(extra["projection"])
+        model.logit_scale.data = extra["logit_scale"].float().to(device)
+    else:
+        print(f"WARNING: No extra_modules.pt found at {extra_pt}")
+
+    model.eval()
+    return model
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
@@ -391,8 +457,15 @@ def main():
 
     # Model config — must match training config
     parser.add_argument("--llm_model",          type=str,  default="Salesforce/SFR-Embedding-2_R")
+    parser.add_argument("--clip_model",         type=str,  default="openai/clip-vit-large-patch14")
+    parser.add_argument("--clip_dim",           type=int,  default=1024)
     parser.add_argument("--llm_dim",            type=int,  default=4096)
+    parser.add_argument("--embed_dim",          type=int,  default=768)
     parser.add_argument("--lora_rank",          type=int,  default=64)
+    parser.add_argument("--clip_lora_rank",     type=int,  default=None,
+                        help="Stage-3 only: CLIP LoRA rank. Defaults to --lora_rank.")
+    parser.add_argument("--llm_lora_rank",      type=int,  default=None,
+                        help="Stage-3 only: SFR LoRA rank. Defaults to --lora_rank.")
     parser.add_argument("--llm_precision",      type=str,  default="4bit",
                         choices=["auto", "4bit", "bf16"])
     parser.add_argument("--attn_implementation",type=str,  default="eager",
@@ -404,8 +477,8 @@ def main():
     parser.add_argument("--output_json",        type=str,  default="fiq_zeroshot_results.json",
                         help="Where to save the recall numbers as JSON")
     # Stage selector
-    parser.add_argument("--stage", type=int, default=1, choices=[1, 2],
-                        help="1 = Stage-1 checkpoint, 2 = Stage-2 checkpoint")
+    parser.add_argument("--stage", type=int, default=1, choices=[1, 2, 3],
+                        help="1 = Stage-1 checkpoint, 2 = Stage-2 checkpoint, 3 = Stage-3 checkpoint")
 
     # Required for Stage-2 only — merged base weights dir
     parser.add_argument("--merged_dir", type=str, default=None,

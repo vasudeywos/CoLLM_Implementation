@@ -8,8 +8,7 @@ details in Sec. 9.2):
   - only the LLM Phi(.) is fine-tuned, with a *fresh*, smaller LoRA adapter
     (rank = alpha = 16, vs. rank 64 used in pre-training; Sec 9.2).
   - image_adapter g(.) and projection p(.) are carried over from Stage-1
-    and remain trainable — they are not "the vision encoder", and the
-    paper gives no indication they should be frozen.
+    and frozen; Stage-2 trains only the fresh LLM LoRA adapter.
   - no Slerp / nearest-neighbor / modification-text synthesis is needed —
     Stage-2 trains on REAL (reference, target, modification_text) triplets.
   - training objective is a single contrastive loss L = L_cl(c_i, z_i)
@@ -212,10 +211,15 @@ class CoLLMStage2(nn.Module):
         )
         self.llm = get_peft_model(self.llm, llm_lora)
 
-        # ---- Bridging modules: carried over from Stage-1, stay trainable -
+        # ---- Bridging modules: carried over from Stage-1 and frozen ------
         self.image_adapter = ImageAdapter(clip_dim, llm_dim).to(torch.float32)
         self.projection = ProjectionHead(llm_dim, embed_dim).to(torch.float32)
         self.logit_scale = nn.Parameter(torch.zeros([]))  # overwritten by load_stage1_bridge_weights()
+        for p in self.image_adapter.parameters():
+            p.requires_grad = False
+        for p in self.projection.parameters():
+            p.requires_grad = False
+        self.logit_scale.requires_grad_(False)
 
         if device is not None:
             self.place_trainable_modules(device)

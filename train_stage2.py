@@ -10,8 +10,8 @@ Key differences from Stage-1's train.py (paper Sec. 3.3 / 9.2):
     text templates.
   - single contrastive loss L = L_cl(c_i, z_i), not the 3-way
     (image-only / text-only / composed) average used in Stage 1.
-  - vision encoder (CLIP) is fully frozen; only the new rank-16 LLM LoRA,
-    image_adapter, and projection are trainable.
+  - vision encoder (CLIP), image_adapter, projection, and logit_scale are
+    frozen; only the new rank-16 LLM LoRA is trainable.
   - the paper trains this stage for ONE epoch and reports that further
     epochs overfit (Table 15: CIRR recall-sum peaks at epoch 1, degrades
     every epoch after) — this script defaults to --epochs 1 accordingly.
@@ -246,21 +246,10 @@ def main():
     max_steps = steps_per_epoch * args.epochs
     print(f"Triplets: {len(dataloader.dataset):,} | Steps/epoch: {steps_per_epoch} | Total steps: {max_steps}")
 
-    logit_scale_ids = {id(model.logit_scale)}
-    main_params = [p for p in model.parameters() if p.requires_grad and id(p) not in logit_scale_ids]
     optimizer = torch.optim.AdamW(
-        [
-            {
-                "params": main_params,
-                "lr": args.lr,
-                "weight_decay": 0.01,
-            },
-            {
-                "params": [model.logit_scale],
-                "lr": args.logit_scale_lr,
-                "weight_decay": 0.0,
-            },
-        ],
+        trainable_params,
+        lr=args.lr,
+        weight_decay=0.01,
         eps=1e-6,
         betas=(0.9, 0.999),
     )

@@ -45,26 +45,27 @@ class CIRTripletDataset(Dataset):
                 ref_image = row["image"]
                 target_image = row["target_image"]
                 modifications = row.get("modifications", [])
+                if not isinstance(modifications, list):
+                    raise TypeError(
+                        f"Row {len(self.rows)} has non-list 'modifications': "
+                        f"{type(modifications).__name__}"
+                    )
 
-                # Expand one image-pair with K modification texts into K triplets:
-                # (reference image, target image, modification_text_1)
-                # (reference image, target image, modification_text_2)
-                # ...
-                if modifications:
-                    for mod_text in modifications:
-                        self.rows.append({
-                            "image": ref_image,
-                            "target_image": target_image,
-                            "mod_text": mod_text,
-                        })
-                else:
-                    self.rows.append({
-                        "image": ref_image,
-                        "target_image": target_image,
-                        "mod_text": "",
-                    })
+                # Each list item describes one part of the full transformation.
+                # Keep one triplet per image pair and combine all parts into the
+                # complete modification instruction used for training.
+                mod_text = " ".join(
+                    text.strip()
+                    for text in modifications
+                    if isinstance(text, str) and text.strip()
+                )
+                self.rows.append({
+                    "image": ref_image,
+                    "target_image": target_image,
+                    "mod_text": mod_text,
+                })
 
-        print(f"Loaded {len(self.rows):,} expanded triplets from {manifest_path}")
+        print(f"Loaded {len(self.rows):,} merged triplets from {manifest_path}")
 
     def __len__(self):
         return len(self.rows)

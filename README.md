@@ -1,6 +1,6 @@
-## Pretrained Weights & Training Logs
+## Training Weights & Training Logs
 
-The pretrained checkpoints, training logs, and intermediate experiment outputs for this project are hosted on Google Drive due to GitHub's file size limitations.
+The Training checkpoints, training logs, and intermediate experiment outputs for this project are hosted on Google Drive due to GitHub's file size limitations.
 
 📂 **Google Drive (Weights & Logs):**  
 https://drive.google.com/drive/folders/1dndI8ub09-Iyyx5a9YEYCPdKVxQxhToi?usp=sharing
@@ -46,5 +46,3 @@ CoLLM_Implementation/
 ```
 
 Training can then be resumed by pointing the appropriate script to the downloaded checkpoint directory.
-
-> **Note:** The weights are hosted externally because GitHub does not support storing large model checkpoints efficiently.
